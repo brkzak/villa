@@ -2,6 +2,7 @@ from pathlib import Path
 import tomllib
 
 from setuptools import find_namespace_packages, find_packages, setup
+from setuptools.command.build_py import build_py
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 
@@ -35,6 +36,22 @@ py_modules = sorted(
     for path in ROOT.glob("*.py")
     if path.name != "setup.py"
 )
+# Sources that modules JIT-compile at run time from their own folder
+# (``Path(__file__).with_name("..._kernel.cu")``, torch.utils.cpp_extension.load).
+# A regular install puts the modules in site-packages, so the sources must go
+# there too: next to the top-level modules and inside the ``lasagna`` package.
+jit_sources = sorted(path.name for path in ROOT.glob("*.cu")) + ["cyl_sdf_volume_ext.cpp"]
+
+
+class build_py_with_jit_sources(build_py):
+    """Copy the JIT sources next to the top-level ``py_modules`` in the build."""
+
+    def run(self):
+        super().run()
+        for name in jit_sources:
+            self.copy_file(str(ROOT / name), str(Path(self.build_lib) / name))
+
+
 packages = find_packages(
     include=("lasagna3d", "lasagna3d.*", "snap_surf", "snap_surf.*", "scripts")
 )
@@ -121,10 +138,13 @@ setup(
         "vesuvius": "../vesuvius/src/vesuvius",
         "vc3d_fiber_format": "../vesuvius/src/vc3d_fiber_format",
     },
-    package_data={"vesuvius": ["**/*.json", "**/*.yaml", "**/*.yml"]},
+    package_data={
+        "vesuvius": ["**/*.json", "**/*.yaml", "**/*.yml"],
+        "lasagna": jit_sources,
+    },
     install_requires=all_requires,
     ext_modules=ext_modules,
-    cmdclass={"build_ext": build_ext},
+    cmdclass={"build_ext": build_ext, "build_py": build_py_with_jit_sources},
     extras_require={
         "test": ["pytest>=7"],
     },
