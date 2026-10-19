@@ -2,6 +2,7 @@ from pathlib import Path
 import tomllib
 
 from setuptools import find_namespace_packages, find_packages, setup
+from setuptools.command.build_py import build_py
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 
@@ -93,6 +94,22 @@ all_requires = sorted(set(
     fit_service_requires + downloader_requires + preprocess_3d_requires
 ))
 
+# Sources the root modules JIT-compile on first use (torch.utils.cpp_extension.load), which they find next to
+# their own file (``Path(__file__).with_name(...)``). ``py_modules`` carries only the .py files, so a regular
+# (non-editable) install put the modules in site-packages without these sources and the first fit failed with
+# FileNotFoundError on e.g. sparse_prefetch_chunks_kernel.cu.
+JIT_SOURCES = sorted(path.name for path in ROOT.glob("*.cu")) + ["cyl_sdf_volume_ext.cpp"]
+
+
+class BuildPyWithJitSources(build_py):
+    """Copy :data:`JIT_SOURCES` into the build next to the top-level modules that load them."""
+
+    def run(self):
+        super().run()
+        for name in JIT_SOURCES:
+            self.copy_file(str(ROOT / name), str(Path(self.build_lib) / name))
+
+
 ext_modules = [
     Pybind11Extension(
         "monotone_norm",
@@ -124,7 +141,7 @@ setup(
     package_data={"vesuvius": ["**/*.json", "**/*.yaml", "**/*.yml"]},
     install_requires=all_requires,
     ext_modules=ext_modules,
-    cmdclass={"build_ext": build_ext},
+    cmdclass={"build_ext": build_ext, "build_py": BuildPyWithJitSources},
     extras_require={
         "test": ["pytest>=7"],
     },
