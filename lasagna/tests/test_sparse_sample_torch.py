@@ -340,6 +340,31 @@ class TensorStoreCacheOnCpuTests(unittest.TestCase):
 				ref[n] += w * vol[:, iz + z, iy + y, ix + x].astype(f32)
 		np.testing.assert_allclose(out.reshape(2, -1).T.numpy(), ref, atol=1e-3)
 
+	def test_http_concurrency_comes_from_the_environment(self) -> None:
+		"""A remote fit is bound by request latency, so the number of HTTP reads in flight must be settable: unset
+		keeps TensorStore's default, a positive integer goes into the cache's context, anything else is refused
+		rather than silently ignored (a typo would bring back the slow fetch unnoticed)."""
+		try:
+			import zarr
+			import sparse_tensorstore_cache
+		except ImportError as exc:  # pragma: no cover - lasagna's env has both
+			self.skipTest(f"needs zarr and tensorstore: {exc}")
+		with mock.patch.dict(os.environ, {}, clear=False):
+			os.environ.pop("LASAGNA_HTTP_CONCURRENCY", None)
+			self.assertIsNone(sparse_tensorstore_cache.http_request_concurrency())
+		for bad in ("0", "-4", "many", "1.5"):
+			with mock.patch.dict(os.environ, {"LASAGNA_HTTP_CONCURRENCY": bad}):
+				with self.assertRaises(ValueError):
+					sparse_tensorstore_cache.http_request_concurrency()
+		with tempfile.TemporaryDirectory() as tmp:
+			path = os.path.join(tmp, "vol.zarr")
+			zarr.create_array(path, shape=(1, 40, 40, 40), chunks=(1, 32, 32, 32), dtype="uint8", zarr_format=2)
+			with mock.patch.dict(os.environ, {"LASAGNA_HTTP_CONCURRENCY": "256"}):
+				cache = sparse_tensorstore_cache.TensorStoreSparseChunkGroupCache(
+					channels=["a"], zarr_path=path, vol_shape_zyx=(40, 40, 40), channel_indices={"a": 0},
+					is_3d_zarr=False, device=torch.device("cpu"), cache_pool_bytes=1 << 20)
+		self.assertEqual(cache._context.spec.to_json()["http_request_concurrency"], {"limit": 256})
+
 
 if __name__ == "__main__":
 	unittest.main()
