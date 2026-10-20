@@ -19,6 +19,24 @@ def _fmt_mib(value: int | float) -> str:
     return f"{float(value) / 1024.0 ** 2:.1f}MiB"
 
 
+def http_request_concurrency() -> int | None:
+    """HTTP reads a remote store may have in flight, from ``LASAGNA_HTTP_CONCURRENCY``; None keeps TensorStore's.
+
+    A remote fit fetches thousands of small chunks, so it is bound by request latency, not bandwidth: from Europe
+    each S3 GET of a 32^3 chunk takes 400-560 ms, and a Mac fit fetched about 35 chunks/s, where 256 requests in
+    flight read 673 chunks/s from the same bucket (brkzak/roldrop, lasagna grow e6f4ec130921, 2026-10-20).
+
+    Raises:
+        ValueError: when the variable is set but not a positive integer.
+    """
+    raw = os.environ.get("LASAGNA_HTTP_CONCURRENCY", "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit() or int(raw) < 1:
+        raise ValueError(f"LASAGNA_HTTP_CONCURRENCY must be a positive integer, got {raw!r}")
+    return int(raw)
+
+
 def zarr_kvstore_spec(zarr_path: str, *, remote: bool) -> dict[str, str]:
     """Build the TensorStore kvstore for a local array or catalog artifact."""
 
@@ -94,11 +112,15 @@ class TensorStoreSparseChunkGroupCache:
         self._pool = sparse_sample_torch.ChunkPool(self.n_channels, device) if self._torch_sampler else None
         self._transfer_stream = None if self._torch_sampler else torch.cuda.Stream(device=device)
 
-        self._context = ts.Context({
+        context = {
             "cache_pool": {"total_bytes_limit": int(cache_pool_bytes)},
             "file_io_concurrency": {"limit": int(file_io_threads)},
             "data_copy_concurrency": {"limit": int(data_copy_threads)},
-        })
+        }
+        http_concurrency = http_request_concurrency()
+        if http_concurrency is not None:
+            context["http_request_concurrency"] = {"limit": http_concurrency}
+        self._context = ts.Context(context)
         self._store = ts.open(
             _zarr_spec(zarr_path, remote=self.remote),
             context=self._context,
@@ -117,6 +139,7 @@ class TensorStoreSparseChunkGroupCache:
               f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB "
               f"cache_pool={cache_pool_bytes / 1024**2:.0f}MiB "
               f"file_io={file_io_threads} data_copy={data_copy_threads} "
+              f"http={http_concurrency or 'default'} "
               f"recheck_cached_data=open sampler={'torch' if self._torch_sampler else 'cuda'}", flush=True)
 
     def prefetch(self, xyz_fullres: torch.Tensor, origin: tuple[float, float, float],
