@@ -5,6 +5,8 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load as _load_ext
 
+import sparse_sample_torch
+
 _module = None
 
 
@@ -61,31 +63,8 @@ def grid_sample_3d_u8_diff(
     Returns:
         (C, D, H, W) float32 CUDA — raw interpolated values (not decoded)
     """
-    if volume.device.type != "cuda":
-        return _grid_sample_3d_u8_diff_cpu(volume, grid, offset, inv_scale)
+    if sparse_sample_torch.use_torch_sampler(volume.device):
+        # The CUDA kernel's math in torch ops: any device, no compiler (sparse_sample_torch).
+        return sparse_sample_torch.dense_grid_sample_3d_u8_diff(volume, grid, offset, inv_scale)
     return _GridSample3DU8Diff.apply(volume, grid, offset, inv_scale)
 
-
-def _grid_sample_3d_u8_diff_cpu(
-    volume: torch.Tensor,
-    grid: torch.Tensor,
-    offset: torch.Tensor,
-    inv_scale: torch.Tensor,
-) -> torch.Tensor:
-    """CPU fallback: convert uint8 to float32 and use F.grid_sample."""
-    import torch.nn.functional as F
-    C, Z, Y, X = volume.shape
-    vol_f = volume.float().unsqueeze(0)  # (1, C, Z, Y, X)
-    # Convert fullres coords to grid_sample [-1, 1] range
-    g = grid.clone()  # (D, H, W, 3) — (x, y, z)
-    g[..., 0] = (g[..., 0] - offset[0]) * inv_scale[0] / max(1, X - 1) * 2 - 1
-    g[..., 1] = (g[..., 1] - offset[1]) * inv_scale[1] / max(1, Y - 1) * 2 - 1
-    g[..., 2] = (g[..., 2] - offset[2]) * inv_scale[2] / max(1, Z - 1) * 2 - 1
-    # F.grid_sample 5D: grid[...,0]→W, grid[...,1]→H, grid[...,2]→D
-    # Our (x,y,z) already maps to (W=X, H=Y, D=Z) — no reorder needed
-    out = F.grid_sample(
-        vol_f, g.unsqueeze(0),
-        mode='bilinear', padding_mode='zeros', align_corners=True,
-    )
-    # (1, C, D, H, W) → (C, D, H, W)
-    return out.squeeze(0)
