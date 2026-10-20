@@ -9,6 +9,8 @@ import numpy as np
 import tensorstore as ts
 import torch
 
+import sparse_sample_torch
+
 _CHUNK_SIZE = 32
 _PADDED = _CHUNK_SIZE + 2
 
@@ -87,7 +89,10 @@ class TensorStoreSparseChunkGroupCache:
         self._batches: list[torch.Tensor] = []
         self._pending: list[tuple[int, int, int, list[object]]] = []
         self._pending_keys: set[tuple[int, int, int]] = set()
-        self._transfer_stream = torch.cuda.Stream(device=device)
+        # Off NVIDIA CUDA the chunks go into one pooled tensor and the table holds slot + 1 (sparse_sample_torch).
+        self._torch_sampler = sparse_sample_torch.use_torch_sampler(device)
+        self._pool = sparse_sample_torch.ChunkPool(self.n_channels, device) if self._torch_sampler else None
+        self._transfer_stream = None if self._torch_sampler else torch.cuda.Stream(device=device)
 
         self._context = ts.Context({
             "cache_pool": {"total_bytes_limit": int(cache_pool_bytes)},
@@ -112,7 +117,7 @@ class TensorStoreSparseChunkGroupCache:
               f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB "
               f"cache_pool={cache_pool_bytes / 1024**2:.0f}MiB "
               f"file_io={file_io_threads} data_copy={data_copy_threads} "
-              f"recheck_cached_data=open", flush=True)
+              f"recheck_cached_data=open sampler={'torch' if self._torch_sampler else 'cuda'}", flush=True)
 
     def prefetch(self, xyz_fullres: torch.Tensor, origin: tuple[float, float, float],
                  spacing: tuple[float, float, float]) -> None:
@@ -120,7 +125,10 @@ class TensorStoreSparseChunkGroupCache:
         origin_t = torch.tensor(origin, dtype=torch.float32, device=dev)
         spacing_t = torch.tensor(spacing, dtype=torch.float32, device=dev)
 
-        from sparse_prefetch_chunks import missing_chunks
+        if self._torch_sampler:
+            missing_chunks = sparse_sample_torch.missing_chunks
+        else:
+            from sparse_prefetch_chunks import missing_chunks
         coords = missing_chunks(xyz_fullres, self.chunk_table, origin_t, spacing_t)
         if coords.numel() == 0:
             return
@@ -155,12 +163,18 @@ class TensorStoreSparseChunkGroupCache:
             n = len(pending)
             C = self.n_channels
             cpu_batch = torch.empty(n, C, _PADDED, _PADDED, _PADDED, dtype=torch.uint8,
-                                    pin_memory=True)
+                                    pin_memory=not self._torch_sampler)
             coords_list: list[tuple[int, int, int]] = []
             for i, (cz, cy, cx, futures) in enumerate(pending):
                 cpu_batch[i].zero_()
                 self._finish_chunk(cz, cy, cx, futures, cpu_batch[i].numpy())
                 coords_list.append((cz, cy, cx))
+
+            if self._torch_sampler:
+                start = self._pool.add(cpu_batch)
+                sparse_sample_torch.set_table_slots(self.chunk_table, coords_list, start)
+                self._record_sync(n, t0)
+                return
 
             with torch.cuda.stream(self._transfer_stream):
                 gpu_batch = cpu_batch.to(self.device, non_blocking=True)
@@ -171,11 +185,7 @@ class TensorStoreSparseChunkGroupCache:
             base_ptr = gpu_batch.data_ptr()
             for i, (cz, cy, cx) in enumerate(coords_list):
                 self.chunk_table[cz, cy, cx] = base_ptr + i * chunk_bytes
-
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            self._last_sync_new = n
-            self._total_new_chunks += n
-            self._total_fetch_ms += dt_ms
+            self._record_sync(n, t0)
         except torch.OutOfMemoryError as exc:
             self._print_cuda_oom_diagnostics(
                 "TensorStoreSparseChunkGroupCache.sync",
@@ -186,6 +196,11 @@ class TensorStoreSparseChunkGroupCache:
                 },
             )
             raise
+
+    def _record_sync(self, n: int, t0: float) -> None:
+        self._last_sync_new = n
+        self._total_new_chunks += n
+        self._total_fetch_ms += (time.perf_counter() - t0) * 1000.0
 
     def end_iteration(self) -> None:
         self._iter_count += 1
@@ -214,7 +229,11 @@ class TensorStoreSparseChunkGroupCache:
                     inv_scale,
                     context=context,
                 )
-            if diff:
+            if self._torch_sampler:
+                sample = (sparse_sample_torch.sparse_grid_sample_3d_u8_diff if diff
+                          else sparse_sample_torch.sparse_grid_sample_3d_u8)
+                out = sample(self._pool.data, self.chunk_table, xyz_fullres, origin, inv_scale)
+            elif diff:
                 from sparse_grid_sample_3d_u8_diff import sparse_grid_sample_3d_u8_diff
                 out = sparse_grid_sample_3d_u8_diff(
                     self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
@@ -224,7 +243,7 @@ class TensorStoreSparseChunkGroupCache:
                 out = sparse_grid_sample_3d_u8(
                     self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
                 )
-            if check_enabled:
+            if check_enabled and not self._torch_sampler:
                 try:
                     torch.cuda.synchronize(self.device)
                 except RuntimeError as exc:
@@ -262,11 +281,15 @@ class TensorStoreSparseChunkGroupCache:
     def cached_cuda_bytes(self) -> int:
         table_bytes = self.chunk_table.numel() * self.chunk_table.element_size()
         batch_bytes = sum(t.numel() * t.element_size() for t in self._batches)
+        if self._pool is not None:
+            batch_bytes += self._pool.nbytes
         return table_bytes + batch_bytes
 
     def cache_diagnostics(self) -> str:
         table_bytes = self.chunk_table.numel() * self.chunk_table.element_size()
         batch_bytes = sum(t.numel() * t.element_size() for t in self._batches)
+        if self._pool is not None:
+            batch_bytes += self._pool.nbytes
         batch_chunks = [int(t.shape[0]) for t in self._batches]
         if len(batch_chunks) > 8:
             batch_desc = f"{batch_chunks[:4]}...{batch_chunks[-4:]}"

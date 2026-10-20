@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import zarr
 
+import sparse_sample_torch
+
 if TYPE_CHECKING:
     pass
 
@@ -63,7 +65,10 @@ class SparseChunkGroupCache:
         # Background loader
         self._executor = ThreadPoolExecutor(max_workers=n_workers)
         self._pending: list[Future] = []
-        self._transfer_stream = torch.cuda.Stream(device=device)
+        # Off NVIDIA CUDA the chunks go into one pooled tensor and the table holds slot + 1 (sparse_sample_torch).
+        self._torch_sampler = sparse_sample_torch.use_torch_sampler(device)
+        self._pool = sparse_sample_torch.ChunkPool(self.n_channels, device) if self._torch_sampler else None
+        self._transfer_stream = None if self._torch_sampler else torch.cuda.Stream(device=device)
 
         # Stats: accumulated over entire optimization
         self._iter_count: int = 0
@@ -74,7 +79,7 @@ class SparseChunkGroupCache:
         table_mib = cZ * cY * cX * 8 / 1024**2
         print(f"[sparse_cache] {','.join(channels)}: chunk_grid={cZ}x{cY}x{cX} "
               f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB "
-              f"prefetch=cuda", flush=True)
+              f"prefetch={'torch' if self._torch_sampler else 'cuda'}", flush=True)
 
     def prefetch(self, xyz_fullres: torch.Tensor, origin: tuple[float, float, float],
                  spacing: tuple[float, float, float]) -> None:
@@ -103,7 +108,10 @@ class SparseChunkGroupCache:
         spacing_t = torch.tensor(spacing, dtype=torch.float32, device=dev)
 
         with torch.no_grad():
-            from sparse_prefetch_chunks import missing_chunks
+            if self._torch_sampler:
+                missing_chunks = sparse_sample_torch.missing_chunks
+            else:
+                from sparse_prefetch_chunks import missing_chunks
             return missing_chunks(
                 xyz_fullres, self.chunk_table, origin_t, spacing_t).cpu()
 
@@ -164,11 +172,17 @@ class SparseChunkGroupCache:
 
         # Stack into pinned CPU tensor for efficient transfer
         cpu_batch = torch.empty(n, C, _PADDED, _PADDED, _PADDED, dtype=torch.uint8,
-                                pin_memory=True)
+                                pin_memory=not self._torch_sampler)
         coords_list = []
         for i, (cz, cy, cx, buf) in enumerate(results):
             cpu_batch[i] = torch.from_numpy(buf)
             coords_list.append((cz, cy, cx))
+
+        if self._torch_sampler:
+            start = self._pool.add(cpu_batch)
+            sparse_sample_torch.set_table_slots(self.chunk_table, coords_list, start)
+            self._record_sync(n, t0)
+            return
 
         # Batch transfer to GPU
         with torch.cuda.stream(self._transfer_stream):
@@ -185,11 +199,12 @@ class SparseChunkGroupCache:
         for i, (cz, cy, cx) in enumerate(coords_list):
             ptr = base_ptr + i * chunk_bytes
             self.chunk_table[cz, cy, cx] = ptr
+        self._record_sync(n, t0)
 
-        dt_ms = (time.perf_counter() - t0) * 1000.0
+    def _record_sync(self, n: int, t0: float) -> None:
         self._last_sync_new = n
         self._total_new_chunks += n
-        self._total_fetch_ms += dt_ms
+        self._total_fetch_ms += (time.perf_counter() - t0) * 1000.0
 
     def end_iteration(self) -> None:
         """Call once per optimizer iteration to accumulate stats."""
@@ -223,7 +238,11 @@ class SparseChunkGroupCache:
                 inv_scale,
                 context=context,
             )
-        if diff:
+        if self._torch_sampler:
+            sample = (sparse_sample_torch.sparse_grid_sample_3d_u8_diff if diff
+                      else sparse_sample_torch.sparse_grid_sample_3d_u8)
+            out = sample(self._pool.data, self.chunk_table, xyz_fullres, origin, inv_scale)
+        elif diff:
             from sparse_grid_sample_3d_u8_diff import sparse_grid_sample_3d_u8_diff
             out = sparse_grid_sample_3d_u8_diff(
                 self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
@@ -233,7 +252,7 @@ class SparseChunkGroupCache:
             out = sparse_grid_sample_3d_u8(
                 self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
             )
-        if check_enabled:
+        if check_enabled and not self._torch_sampler:
             try:
                 torch.cuda.synchronize(self.device)
             except RuntimeError as exc:
