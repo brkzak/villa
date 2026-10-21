@@ -1089,3 +1089,15 @@ def test_two_way_fiber_traces_are_written_as_one_surface(tmp_path):
     area = lambda name: json.loads((tmp_path/name/'meta.json').read_text())['area_vx2']
     assert area('both') == pytest.approx(area('up')+area('down'))
 
+
+
+def test_open_volume_reads_local_levels_and_needs_a_cache_for_remote_ones(tmp_path):
+    """The tracer opens a local pyramid level directly and a remote one (s3/https) only through a chunk cache: a remote
+    volume without one must fail before any network access, rather than streaming every block uncached."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import open_volume
+    import zarr
+    zarr.open_array(str(tmp_path/'v.zarr'/'0'), mode='w', shape=(4, 5, 6), chunks=(2, 2, 2), dtype='u1',
+                    zarr_format=2)[:] = 7
+    assert open_volume(str(tmp_path/'v.zarr'), 0, None).shape == (4, 5, 6)
+    with pytest.raises(ValueError, match='cache directory'):
+        open_volume('s3://bucket/volume.zarr', 0, None)
