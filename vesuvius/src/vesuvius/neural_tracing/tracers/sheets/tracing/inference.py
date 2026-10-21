@@ -32,7 +32,7 @@ import torch
 
 from vesuvius.neural_tracing.tracers.shared.geometry import resample_polyline
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray, RemoteChunkedArray
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import collate_fibers
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
@@ -81,6 +81,17 @@ def read_block(volume: ChunkedArray, pos: np.ndarray, pad: float, level: int):
     return volume.read(origin, size), origin
 
 
+def open_volume(volume: str, level: int, cache_dir: str | None, cache_bytes: int = 1 << 30) -> ChunkedArray:
+    """The CT level the tracer reads: a local OME-Zarr pyramid's level, or a remote one (``s3://``, ``http(s)://``)
+    fetched on demand into ``cache_dir`` (``RemoteChunkedArray``: decoded chunks persisted there, so a re-trace of
+    the same region needs no network)."""
+    if str(volume).startswith(('s3://', 'http://', 'https://')):
+        if not cache_dir:
+            raise ValueError(f'Tracing in the remote volume {volume} needs a cache directory (--cache-dir)')
+        return RemoteChunkedArray(volume, level, cache_dir, cache_bytes)
+    return ChunkedArray(f'{volume}/{level}', cache_bytes)
+
+
 def _reach_row(kept: np.ndarray, above: np.ndarray) -> np.ndarray:
     """Kept columns of a row connected to the reached columns of the row above: each contiguous run of kept
     columns is reached if any of its columns is directly below a reached column."""
@@ -107,7 +118,7 @@ def connected_keep(confs: np.ndarray, threshold: float) -> np.ndarray:
 
 @torch.no_grad()
 def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, device, stop_on_disconnect: bool = True,
-          follow: bool = False, fibers: dict | None = None):
+          follow: bool = False, fibers: dict | None = None, cache_dir: str | None = None):
     """Rows (T+1, C, 3) including the seed and per-column confidences (T+1, C).
 
     C is the number of dense Hermite samples; each gets the lower confidence of its gap's two control points. With ``stop_on_disconnect`` (default), tracing stops at the first row with no
@@ -115,7 +126,7 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     form separate components. That row is not returned. Use ``connected_keep`` for the points to write.
     ``follow``: fiber-following mode (a front across a fiber, advancing along it). ``fibers``: the fibers around the
     trace (``data.fibers.episode_fibers``, the seed fiber as instance 0), shown to a model with
-    ``model.fiber_tokens``.
+    ``model.fiber_tokens``. ``cache_dir``: where the chunks of a remote volume are kept (``open_volume``).
     """
     d = cfg.data
     count = len(seed)
@@ -127,7 +138,7 @@ def trace(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: int, devic
     pos = torch.tensor(seed, dtype=torch.float32, device=device)[None]
     prev = torch.tensor(seed-d.step*unit, dtype=torch.float32, device=device)[None]
     front = Front(pos, prev, torch.ones(1, count, device=device))
-    volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 1 << 30)
+    volume = open_volume(d.volume, d.volume_level, cache_dir)
     pad = view_radius(cfg.model)+d.step+4
     columns = lambda pos, conf, dense=None: tuple(x[0].cpu().numpy() for x in tracer.output_columns(pos, conf, dense))
     p, c = columns(front.pos, front.conf)
@@ -277,6 +288,7 @@ def main(argv=None):
                     help='replace the path prefix OLD by NEW in the checkpoint\'s data paths (volumes, patch '
                          'directories), e.g. for a checkpoint trained on another machine; repeatable')
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--cache-dir', help='where the chunks of a remote --volume (s3://, https://) are kept')
     args = ap.parse_args(argv)
     path = resolve_checkpoint(args.checkpoint)
     model, cfg, _ = load_checkpoint(path, args.device)
@@ -292,7 +304,7 @@ def main(argv=None):
     seed = resample(points, cfg.data.point_spacing)
     direction = np.stack([np.interp(np.linspace(0, len(points)-1, len(seed)), np.arange(len(points)), direction[:, i])
                           for i in range(3)], 1)
-    rows, confs = trace(model, cfg, seed, direction, args.steps, args.device)
+    rows, confs = trace(model, cfg, seed, direction, args.steps, args.device, cache_dir=args.cache_dir)
     out = Path(args.out)
     write_trace(out, rows, confs, cfg, cfg.trace.confidence_threshold,
                 dict(vars(args), checkpoint=checkpoint_source(args.checkpoint, path), volume=cfg.data.volume,
