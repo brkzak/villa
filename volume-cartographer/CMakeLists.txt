@@ -74,6 +74,8 @@ option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
 option(VC_USE_SCCACHE "Route the compiler through sccache" OFF)
+option(VC_CLANG_OPENMP
+       "Link real OpenMP in Clang builds instead of the no-op shim (e.g. Homebrew LLVM's libomp on macOS)" OFF)
 option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
 option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
 set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
@@ -698,13 +700,16 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     FetchContent_MakeAvailable(vc_delta3d)
 endif()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR MSVC)
+if((CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT VC_CLANG_OPENMP) OR MSVC)
     # Clang and MSVC both use the no-op OpenMP shim: -fopenmp / -openmp is never
     # enabled, so every `#pragma omp` is ignored and the omp_*() runtime calls
     # resolve to the inline stubs in core/openmp_stub/omp.h. These builds run the
     # parallel regions serially, which is why the ignored `critical`/`atomic`
     # pragmas remain correct. Only the GCC build links real OpenMP. (MSVC
     # silences the resulting unknown-pragma C4068 in the compiler-family block.)
+    # VC_CLANG_OPENMP=ON opts a Clang build into real OpenMP: without it every
+    # tool runs on one core whatever its thread setting (a macOS GrowPatch grow
+    # sat at ~110 % CPU where the GCC build used ~2.2 cores).
     include_directories(${CMAKE_SOURCE_DIR}/core/openmp_stub)
     add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)

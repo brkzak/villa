@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR] [--jobs N]
+  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--openmp] [--build-dir DIR] [--jobs N]
 
 Build VC3D natively on macOS with Homebrew LLVM/Clang.
 
@@ -12,6 +12,8 @@ Options:
   --install-deps   Install missing Homebrew formulae before configuring.
   --ccache         Enable ccache (installed when combined with --install-deps).
   --sccache        Enable sccache (installed when combined with --install-deps).
+  --openmp         Link real OpenMP (Homebrew LLVM's libomp) instead of the no-op
+                   shim, so OpenMP loops use more than one core.
   --build-dir DIR  Override the default build directory: build-macos
   --jobs N         Parallel build jobs. Defaults to the host CPU count.
 USAGE
@@ -30,6 +32,7 @@ cd "$script_dir/.."
 install_deps=0
 use_ccache=0
 use_sccache=0
+use_openmp=0
 build_dir="build-macos"
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
@@ -45,6 +48,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --sccache)
       use_sccache=1
+      shift
+      ;;
+    --openmp)
+      use_openmp=1
       shift
       ;;
     --build-dir)
@@ -177,6 +184,11 @@ fi
 if (( use_sccache )); then
   extra_cmake_args+=("-DVC_USE_CCACHE=OFF" "-DVC_USE_SCCACHE=ON")
   sccache --zero-stats
+fi
+if (( use_openmp )); then
+  # Homebrew's llvm keg ships libomp and omp.h next to its clang; pointing
+  # FindOpenMP there keeps Apple's (OpenMP-less) toolchain out of the loop.
+  extra_cmake_args+=("-DVC_CLANG_OPENMP=ON" "-DOpenMP_ROOT=$brew_prefix/opt/llvm")
 fi
 # Eigen ships its CMake config under <prefix>/share/eigen3/cmake. Derive
 # the prefix via `brew --prefix eigen` so a Homebrew revision bump (eigen
