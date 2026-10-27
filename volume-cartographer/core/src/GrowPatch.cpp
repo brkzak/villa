@@ -4704,6 +4704,59 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     auto neighs = parse_growth_directions(params);
 
+    // Upright square (upright_square_cells > 0): grow only the square of that half side, in cells, whose sides run
+    // along and across the volume's +z. The patch grows the same number of cells along both lattice axes, but the
+    // lattice settles at an arbitrary angle to z, so a patch cut to an upright square afterwards wasted the growth
+    // outside it. Once the patch has upright_lock_generation generations, the lattice direction of +z is fitted
+    // (z = a*row + b*col + c over the valid points) and candidates outside the square, measured from the seed quad's
+    // centre along that direction and across it, are skipped; the grow ends when the square is full.
+    const int upright_half = params.value("upright_square_cells", 0);
+    const int upright_lock_gen = params.value("upright_lock_generation", 8);
+    if (upright_half < 0 || (upright_half > 0 && (upright_lock_gen < 2 || 2 * upright_lock_gen > upright_half))) {
+        throw std::runtime_error("upright_square_cells must be 0 (off) or at least twice upright_lock_generation (>= 2)");
+    }
+    if (upright_half > 0 && resume_surf) {
+        throw std::runtime_error("upright_square_cells is for a grow from a seed, not a resume");
+    }
+    bool upright_locked = false;
+    cv::Vec2d upright_up{0.0, 0.0};  // unit (row, col) lattice direction in which z grows
+    const cv::Vec2d upright_centre{y0 + 0.5, x0 + 0.5};
+    auto inside_upright_square = [&](const cv::Vec2i& p) {
+        if (!upright_locked) {
+            return true;
+        }
+        const cv::Vec2d d{p[0] - upright_centre[0], p[1] - upright_centre[1]};
+        const double along = d[0] * upright_up[0] + d[1] * upright_up[1];
+        const double across = -d[0] * upright_up[1] + d[1] * upright_up[0];
+        return std::abs(along) <= upright_half && std::abs(across) <= upright_half;
+    };
+    auto lock_upright_square = [&]() {
+        cv::Matx33d ata = cv::Matx33d::zeros();
+        cv::Vec3d atb{0.0, 0.0, 0.0};
+        for (int j = used_area.y; j < used_area.br().y; ++j) {
+            for (int i = used_area.x; i < used_area.br().x; ++i) {
+                if ((trace_params.state(j, i) & STATE_LOC_VALID) == 0) {
+                    continue;
+                }
+                const cv::Vec3d a{static_cast<double>(j), static_cast<double>(i), 1.0};
+                ata += a * a.t();
+                atb += a * trace_params.dpoints(j, i)[2];
+            }
+        }
+        cv::Vec3d abc;
+        if (!cv::solve(ata, atb, abc, cv::DECOMP_SVD)) {
+            throw std::runtime_error("upright square: cannot fit the lattice direction of z");
+        }
+        const double n = std::hypot(abc[0], abc[1]);
+        if (!(n > 1e-6)) {
+            throw std::runtime_error("upright square: z does not change across the patch (a sheet facing z?)");
+        }
+        upright_up = {abc[0] / n, abc[1] / n};
+        upright_locked = true;
+        std::cout << "upright square: half side " << upright_half << " cells, lattice up (row, col) "
+                  << upright_up << " at generation " << generation << std::endl;
+    };
+
     int local_opt_r = 3;
 
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
@@ -4718,6 +4771,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         generation++;
         if (stop_gen && generation >= stop_gen)
             break;
+        if (upright_half > 0 && !upright_locked && generation >= upright_lock_gen) {
+            lock_upright_square();
+        }
 
         auto is_loc_valid = [&](const cv::Vec2i& p) {
             return bounds.contains(cv::Point(p[1], p[0])) &&
@@ -4739,6 +4795,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                  trace_data.allowed_growth_mask(p) == 0)) {
                 return;
             }
+            if (!inside_upright_square(p)) {
+                return;
+            }
 
             trace_params.state(p) |= STATE_PROCESSING;
             cands.push_back(p);
@@ -4754,7 +4813,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
-        if (!used_area_fully_valid) {
+        // An upright square is never a full rectangle of the lattice, so it always grows from its fringe.
+        if (!used_area_fully_valid && !upright_locked) {
             // Irregular resumed patches should fill holes within the existing grid before
             // growing the bounding rectangle. For right growth, this means every valid
             // point with an invalid point immediately to its right contributes that
