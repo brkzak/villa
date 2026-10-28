@@ -1053,6 +1053,14 @@ struct NormalConstraintPlane {
      // Caching for nearby paths
      using PathCachePayload = std::vector<std::vector<cv::Point>>;
      mutable std::array<PointPairCache<PathCachePayload>, 2> path_caches_;
+
+     // Per-segment constants of the cached paths (filled with path_caches_), so the normal loss does not
+     // recompute a midpoint, a sqrt and a normal for every segment on every residual evaluation.
+     struct SegmentNormal {
+         cv::Point2f mid;     // segment midpoint, as seg_dist_sq_appx computes it
+         cv::Point2f normal;  // unit normal of the segment (zero for a zero-length segment)
+     };
+     mutable std::array<std::vector<SegmentNormal>, 2> segment_normals_;
  
      // Caching for snapping loss results
      struct SnapLossPayload {
@@ -1316,6 +1324,7 @@ struct NormalConstraintPlane {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
             auto raw_paths = normal_grid.get(midpoint_cv, query_radius_);
             auto filtered_paths = filter_and_split_paths(raw_paths, p1_cv, p2_cv);
+            fill_segment_normals(filtered_paths, segment_normals_[grid_idx]);
             path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume);
             // Invalidate snapping cache whenever the path cache is updated
             snap_loss_caches_[grid_idx] = {};
@@ -1326,44 +1335,41 @@ struct NormalConstraintPlane {
             return T(0.0);
         }
 
-        T total_weighted_dot_loss = T(0.0);
-        T total_weight = T(0.0);
+        // The weights and segment normals are constants and |dot| only picks a sign per segment, so
+        //   sum_i w_i (1 - |e . n_i|) = W - e . S,  W = sum_i w_i,  S = sum_i w_i sign(e . n_i) n_i,
+        // with e the edge normal. W and S are summed in plain doubles and only the final dot product is
+        // evaluated on T: one Jet product instead of one per segment, with the same value and derivative
+        // (ceres::abs(Jet) also takes its sign from the value part). The residual is the same up to rounding.
+        const double edge_normal_val_x = val(edge_normal_x);
+        const double edge_normal_val_y = val(edge_normal_y);
+        const cv::Point2f edge_mid = 0.5*(p1_cv+p2_cv);
+        double total_weight = 0.0;
+        double weighted_normal_x = 0.0;
+        double weighted_normal_y = 0.0;
 
-        for (const std::vector<cv::Point>& path : nearby_paths) {
-            if (path.size() < 2) continue;
+        for (const SegmentNormal& seg : segment_normals_[grid_idx]) {
+            const cv::Point2f d = edge_mid - seg.mid;
+            float dist_sq = d.x*d.x+d.y*d.y;
+            if (dist_sq > roi_radius_*roi_radius_)
+                continue;
 
-            for (size_t i = 0; i < path.size() - 1; ++i) {
-                cv::Point2f p_a = path[i];
-                cv::Point2f p_b = path[i+1];
+            dist_sq = std::max(10.0f, dist_sq);
 
-                float dist_sq = seg_dist_sq_appx(p1_cv, p2_cv, p_a, p_b);
-                if (dist_sq > roi_radius_*roi_radius_)
-                    continue;
-
-                dist_sq = std::max(10.0f, dist_sq);
-
-                T weight_n = T(1.0 / dist_sq);
-
-                cv::Point2f tangent = p_b - p_a;
-                float length = cv::norm(tangent);
-                if (length > 0) {
-                    tangent /= length;
-                }
-                cv::Point2f normal(-tangent.y, tangent.x);
-
-                T dot_product = edge_normal_x * T(normal.x) + edge_normal_y * T(normal.y);
-                if (!direction_aware_) {
-                    dot_product = ceres::abs(dot_product);
-                }
-
-                total_weighted_dot_loss += weight_n*(T(1.0) - dot_product);
-                total_weight += weight_n;
+            const double weight_n = 1.0 / dist_sq;
+            double sign = 1.0;
+            if (!direction_aware_) {
+                sign = std::copysign(1.0, edge_normal_val_x * seg.normal.x + edge_normal_val_y * seg.normal.y);
             }
+
+            total_weight += weight_n;
+            weighted_normal_x += weight_n * sign * seg.normal.x;
+            weighted_normal_y += weight_n * sign * seg.normal.y;
         }
 
         T normal_loss = T(0.0);
-        if (total_weight > T(1e-9)) {
-            normal_loss = total_weighted_dot_loss/total_weight;
+        if (total_weight > 1e-9) {
+            const T weighted_dot = edge_normal_x * T(weighted_normal_x) + edge_normal_y * T(weighted_normal_y);
+            normal_loss = (T(total_weight) - weighted_dot) / T(total_weight);
         }
 
         // Snapping logic
@@ -1450,6 +1456,24 @@ struct NormalConstraintPlane {
         }
 
         return T(w_normal)*normal_loss + T(w_snap)*snapping_loss;
+    }
+
+    // Midpoints and unit normals of every segment of `paths`, in path order, computed exactly as the
+    // per-segment loop of calculate_normal_snapping_loss used to compute them on every evaluation.
+    static void fill_segment_normals(const PathCachePayload& paths, std::vector<SegmentNormal>& out) {
+        out.clear();
+        for (const std::vector<cv::Point>& path : paths) {
+            for (size_t i = 0; i + 1 < path.size(); ++i) {
+                const cv::Point2f p_a = path[i];
+                const cv::Point2f p_b = path[i+1];
+                cv::Point2f tangent = p_b - p_a;
+                const float length = cv::norm(tangent);
+                if (length > 0) {
+                    tangent /= length;
+                }
+                out.push_back({0.5*(p_a+p_b), cv::Point2f(-tangent.y, tangent.x)});
+            }
+        }
     }
 
     static float seg_dist_sq_appx(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4)
