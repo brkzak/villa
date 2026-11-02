@@ -45,6 +45,29 @@ def combined_patch_discovery_support(
     return support
 
 
+def strided_support_corners(support: np.ndarray, stride: int) -> np.ndarray:
+    """Return the (y, x) origin of every ``stride`` x ``stride`` cell that holds a support pixel.
+
+    The rows are the ones ``np.unique(np.stack([ys // stride * stride, xs // stride * stride], axis=1), axis=0)``
+    gives over ``ys, xs = np.nonzero(support)``, in the same lexicographic (row-major) order, but found per cell
+    instead of by sorting one row per support pixel, which took minutes on a ~10^8-pixel segment layer.
+    """
+    support = np.asarray(support, dtype=bool)
+    if support.ndim != 2:
+        raise ValueError(f"support must be 2D, got shape {support.shape}")
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
+    height, width = support.shape
+    cells_y, cells_x = -(-height // stride), -(-width // stride)
+    if (cells_y * stride, cells_x * stride) != (height, width):
+        padded = np.zeros((cells_y * stride, cells_x * stride), dtype=bool)
+        padded[:height, :width] = support
+        support = padded
+    occupied = support.reshape(cells_y, stride, cells_x, stride).any(axis=(1, 3))
+    cell_y, cell_x = np.nonzero(occupied)
+    return np.stack([cell_y * stride, cell_x * stride], axis=1).astype(np.intp)
+
+
 def _scan_geometry(segment: Segment, open_volume: Callable):
     finding = segment.data_config.patch_finding
     if finding.scan_scale is not None and finding.scan_scale != segment.scale:
@@ -83,12 +106,16 @@ def find_segment_patches(
     validation_surface = (
         None if validation is None else int(validation.shape[0] // 2)
     )
-    support = combined_patch_discovery_support(
-        supervision[mask_surface],
-        None if validation is None else validation[validation_surface],
+    # Each label layer is read once and sliced in memory below: a zarr read per corner (two or three per corner,
+    # tens of thousands of corners per segment) kept a fine-tune on ~70 replay segments in patch discovery for
+    # most of an hour before its first step, with the GPU idle. The values are the same either way.
+    supervision_layer = np.asarray(supervision[mask_surface])
+    inklabels_layer = np.asarray(inklabels[mask_surface])
+    validation_layer = (
+        None if validation is None else np.asarray(validation[validation_surface])
     )
-    ys, xs = np.nonzero(support)
-    if len(ys) == 0:
+    support = combined_patch_discovery_support(supervision_layer, validation_layer)
+    if not support.any():
         raise ValueError(f"{segment.supervision_mask} contains no nonzero voxels at scan scale")
     stride = max(
         1,
@@ -99,25 +126,21 @@ def find_segment_patches(
             )
         ),
     )
-    corners = np.unique(
-        np.stack([ys // stride * stride, xs // stride * stride], axis=1), axis=0
-    )
+    corners = strided_support_corners(support, stride)
     scan_h = max(1, int(round(patch_size[1] / scale_y)))
     scan_w = max(1, int(round(patch_size[2] / scale_x)))
     training: list[Patch] = []
     held_out: list[Patch] = []
     for y_scan, x_scan in corners.tolist():
         y_scan, x_scan = int(y_scan), int(x_scan)
-        supervision_patch = supervision[
-            mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+        supervision_patch = supervision_layer[
+            y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
         has_training = bool(supervision_patch.size and np.any(supervision_patch))
         has_validation = False
-        if validation is not None:
-            validation_patch = validation[
-                validation_surface,
-                y_scan : y_scan + scan_h,
-                x_scan : x_scan + scan_w,
+        if validation_layer is not None:
+            validation_patch = validation_layer[
+                y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
             ]
             has_validation = bool(validation_patch.size and np.any(validation_patch))
             if has_training and has_validation:
@@ -136,8 +159,8 @@ def find_segment_patches(
                     supervision_mask_override=segment.validation_mask,
                 )
             )
-        label_patch = inklabels[
-            mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+        label_patch = inklabels_layer[
+            y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
         if has_training and labeled_patch_coverage(label_patch) >= (
             segment.data_config.patch_finding.min_labeled_coverage

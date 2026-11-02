@@ -31,6 +31,7 @@ from vesuvius.ink_detection.data.patch_finding_default import (
     find_segment_patches,
     find_segment_unlabeled_patches,
     labeled_patch_coverage,
+    strided_support_corners,
 )
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
 from vesuvius.ink_detection.data.segment import (
@@ -292,6 +293,24 @@ def test_patch_discovery_math_and_filter_empty_tile_subtiling():
             stride=4,
             filter_empty_tile=False,
         )
+
+
+def test_strided_support_corners_match_the_per_pixel_unique():
+    """Patch discovery finds its corners per stride cell instead of sorting one row per support pixel (minutes on a
+    full segment layer). The corners, and so every patch and the patch cache, must be exactly the rows and the order
+    the per-pixel np.unique gave, also for layers that the stride does not divide and for stride 1."""
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        height, width = (int(v) for v in rng.integers(1, 70, size=2))
+        stride = int(rng.integers(1, 12))
+        support = rng.random((height, width)) < rng.choice([0.002, 0.05, 0.5, 1.0])
+        ys, xs = np.nonzero(support)
+        expected = np.unique(
+            np.stack([ys // stride * stride, xs // stride * stride], axis=1), axis=0
+        ).reshape(-1, 2)
+        np.testing.assert_array_equal(strided_support_corners(support, stride), expected)
+    with pytest.raises(ValueError, match="stride"):
+        strided_support_corners(np.ones((2, 2), dtype=bool), 0)
 
 
 def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
