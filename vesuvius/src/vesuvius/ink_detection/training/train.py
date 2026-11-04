@@ -465,6 +465,24 @@ def _run_training(request: TrainingRequest) -> int:
         "patches": shared_dataset.training_patches,
         "segments": shared_dataset.segments,
     }
+    group_objective = None
+    if config.group_objective is not None:
+        from vesuvius.ink_detection.training.group_objectives import GroupObjective
+
+        if accelerator.num_processes != 1:
+            # Per-group backward passes would each all-reduce, and PCGrad's projection is of one batch's gradients.
+            raise ValueError("group_objective runs on one process only")
+        group_objective = GroupObjective(
+            config.group_objective.mode,
+            config.group_objective.groups,
+            config.group_objective.dataset_groups,
+            dro_step_size=config.group_objective.dro_step_size,
+            seed=config.seed,
+        )
+        group_objective.check_datasets(
+            [patch.segment.dataset_idx for patch in shared_dataset.training_patches]
+        )
+        train_dataset_kwargs["emit_dataset_index"] = True
     if config.dynamic_label is not None:
         train_dataset_kwargs.update(
             emit_image_for_label=True,
@@ -687,6 +705,14 @@ def _run_training(request: TrainingRequest) -> int:
             "sampling_observed=" + json.dumps(observed, sort_keys=True)
         )
 
+    def write_group_objective(training_step: int) -> None:
+        if group_objective is None or not accelerator.is_main_process:
+            return
+        _write_json_replace(
+            config.out_dir / "group_objective.json",
+            group_objective.summary(training_step),
+        )
+
     def save_checkpoint(
         step: int,
         *,
@@ -795,7 +821,7 @@ def _run_training(request: TrainingRequest) -> int:
             targets_with_ignore = concatenate_deep_supervision_ignore(
                 targets, ignore_mask, loss_predictions
             )
-            scalar_loss = loss(
+            loss_inputs = (
                 type(loss_predictions)(
                     value.float() for value in loss_predictions
                 )
@@ -807,9 +833,24 @@ def _run_training(request: TrainingRequest) -> int:
                 if isinstance(targets_with_ignore, (list, tuple))
                 else targets_with_ignore.float(),
             )
+            # Before the whole batch's loss, so the loss's latest_metrics stay the whole batch's.
+            group_terms = (
+                None
+                if group_objective is None
+                else group_objective.losses(
+                    loss, *loss_inputs, batch["dataset_index"]
+                )
+            )
+            # With a group objective this is still the whole batch's loss: the one logged, so runs compare.
+            scalar_loss = loss(*loss_inputs)
             if not torch.isfinite(scalar_loss):
                 raise RuntimeError(f"Non-finite loss at step {step}")
-            accelerator.backward(scalar_loss)
+            if group_objective is None:
+                accelerator.backward(scalar_loss)
+            else:
+                group_objective.backward(
+                    group_terms, list(model.parameters()), accelerator.backward
+                )
             if (
                 config.grad_clip is not None
                 and config.grad_clip > 0
@@ -894,6 +935,11 @@ def _run_training(request: TrainingRequest) -> int:
                     torch.cuda.reset_peak_memory_stats(accelerator.device)
                 benchmark_started_at = time.perf_counter()
 
+        if group_objective is not None and (
+            (step + 1) % config.group_objective.write_every == 0
+            or step + 1 == config.num_iterations
+        ):
+            write_group_objective(step + 1)
         should_log = step % config.log_every == 0
         train_loss = float(
             _distributed_mean_scalar(accelerator, scalar_loss).item()

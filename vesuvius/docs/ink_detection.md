@@ -347,6 +347,9 @@ Sampling and objective controls:
 | `loss.bce_label_smoothing`, `loss.dice_label_smoothing` | Label-smoothing factors. |
 | `loss.dice_weight`, `loss.ce_weight` | Shorthand Dice and BCE weights. |
 | `loss.terms[]` | `name`, optional `metric_name`, `weight`, `weight_dice`, `weight_ce`, smoothing fields, and `bce_kwargs`. |
+| `group_objective.mode` | Optional. `group_dro` (a weight per group; the weight of a group with a high loss grows) or `pcgrad` (a gradient per group; conflicting parts are projected out). Off when absent. Needs two or more groups, one process, and no `extra_patches`; `pcgrad` needs `grad_acc_steps=1`. See `training/group_objectives.py`. |
+| `group_objective.dro_step_size`, `group_objective.write_every` | GroupDRO's step size (default 0.01); steps between writes of `group_objective.json` (default 50). |
+| `datasets[].objective_group` | The group of a dataset's samples (for example its scroll). Every dataset with training patches needs one when `group_objective` is set, and none may have one without it. The logged `loss` stays the whole batch's loss. |
 
 Optimization, execution, and artifact controls:
 
@@ -385,7 +388,10 @@ Optimization, execution, and artifact controls:
 - append-only `validation_metrics.jsonl`;
 - `train_previews/` and `val_previews/` LZW TIFF montages;
 - `sampling_observed.json` for fixed-prior sampling;
-- `gradient_health.json` when finite-gradient checking is enabled; and
+- `gradient_health.json` when finite-gradient checking is enabled;
+- `group_objective.json` with `group_objective`: each group's batches and mean
+  loss, GroupDRO's weights, and with PCGrad each pair of groups' batches
+  together, mean gradient cosine and share of batches in conflict; and
 - `benchmark_summary.json` when inline benchmarking is enabled.
 
 The online `val_loss` is the configured smoothed training objective. It is not
