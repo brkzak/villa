@@ -117,8 +117,12 @@ class InkDataset(Dataset):
         segments: list[Segment] | None = None,
         emit_image_for_label: bool = False,
         input_mask_threshold: float | None = None,
+        emit_dataset_index: bool = False,
     ) -> None:
         self.config = config
+        # A group objective (training.group_objectives) needs each sample's config dataset; off, the samples are
+        # as they were.
+        self.emit_dataset_index = bool(emit_dataset_index)
         self.patch_size = config.patch_size
         self.mode = config.mode
         self.do_augmentations = bool(do_augmentations)
@@ -618,16 +622,23 @@ class InkDataset(Dataset):
         data["is_unlabeled"] = torch.tensor(patch.is_unlabeled, dtype=torch.bool)
         return data
 
+    def _with_dataset_index(self, sample: dict, patch: Patch) -> dict:
+        if self.emit_dataset_index:
+            sample["dataset_index"] = torch.tensor(patch.segment.dataset_idx, dtype=torch.long)
+        return sample
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         requested_index = int(index)
         if self.mode == "flat":
-            return self._flat_sample(self.patches[requested_index])
+            patch = self.patches[requested_index]
+            return self._with_dataset_index(self._flat_sample(patch), patch)
         current_index = requested_index
         while True:
             patch = self.patches[current_index]
             sample = self._native_sample(patch)
             if sample is not None:
-                return sample
+                # The patch the sample came from: a replacement's own dataset when the requested one was inadmissible.
+                return self._with_dataset_index(sample, patch)
             if len(self.patches) <= 1:
                 raise RuntimeError(
                     "Cannot resample an inadmissible native patch from a dataset "

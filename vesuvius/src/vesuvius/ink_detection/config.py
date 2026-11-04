@@ -174,6 +174,76 @@ def _extra_patches_config(
     )
 
 
+GROUP_OBJECTIVE_MODES = ("group_dro", "pcgrad")
+
+
+@dataclass(frozen=True)
+class GroupObjectiveConfig:
+    """A training objective over groups of the data (``training.group_objectives``).
+
+    ``group_objective`` in the config switches it on; each dataset names its group with ``objective_group`` (for
+    example its scroll). ``mode`` is ``group_dro`` (each group's loss gets a weight, and the weight of a group with a
+    high loss grows: Sagawa et al. 2020, "Distributionally Robust Neural Networks") or ``pcgrad`` (each group's
+    gradient on its own, and a part of one that conflicts with another's is taken out: Yu et al. 2020, "Gradient
+    Surgery for Multi-Task Learning"). PCGrad also records how often each pair of groups agrees, the cosine of their
+    gradients, in ``group_objective.json``.
+    """
+
+    mode: str
+    groups: tuple[str, ...]
+    # The group of each config dataset, in config order; None for a dataset without one (only a dataset with no
+    # training patch may lack it, which the training checks once the patches are known).
+    dataset_groups: tuple[str | None, ...]
+    dro_step_size: float = 0.01
+    write_every: int = 50
+
+
+def _group_objective_config(authored: Mapping[str, Any]) -> GroupObjectiveConfig | None:
+    """``group_objective`` and each dataset's ``objective_group`` (:class:`GroupObjectiveConfig`); None when off.
+
+    Raises:
+        TypeError: a ``group_objective`` that is not an object, or a group name that is not a string.
+        ValueError: an unknown mode, a step size that is not positive or a ``write_every`` below 1, fewer than two
+            groups (one group is the plain loss), or ``objective_group`` without ``group_objective``.
+    """
+    value = authored.get("group_objective")
+    datasets = authored.get("datasets") or ()
+    named = [d.get("objective_group") if isinstance(d, Mapping) else None for d in datasets]
+    if not value:
+        if any(name not in (None, "") for name in named):
+            raise ValueError("datasets name an objective_group, but group_objective is not set")
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("group_objective must be an object or null")
+    mode = str(value.get("mode", "")).strip().lower()
+    if mode not in GROUP_OBJECTIVE_MODES:
+        raise ValueError(f"group_objective.mode must be one of {GROUP_OBJECTIVE_MODES}, got {mode!r}")
+    groups: list[str | None] = []
+    for index, name in enumerate(named):
+        if name in (None, ""):
+            groups.append(None)
+            continue
+        if not isinstance(name, str):
+            raise TypeError(f"datasets[{index}].objective_group must be a string")
+        groups.append(name)
+    unique = tuple(sorted({name for name in groups if name is not None}))
+    if len(unique) < 2:
+        raise ValueError(f"group_objective needs datasets of two or more objective_groups, got {list(unique)}")
+    step = float(value.get("dro_step_size", 0.01))
+    if not step > 0.0:
+        raise ValueError(f"group_objective.dro_step_size must be positive, got {step}")
+    write_every = int(value.get("write_every", 50))
+    if write_every < 1:
+        raise ValueError(f"group_objective.write_every must be >= 1, got {write_every}")
+    return GroupObjectiveConfig(
+        mode=mode,
+        groups=unique,
+        dataset_groups=tuple(groups),
+        dro_step_size=step,
+        write_every=write_every,
+    )
+
+
 class _FrozenMapping(Mapping):
     """Small ordered immutable mapping that remains safe across spawn/pickle."""
 
@@ -1456,6 +1526,7 @@ class TrainingConfig:
     extra_patches: ExtraPatchesConfig
     force_full_supervision: bool
     save_iterations: tuple[int, ...]
+    group_objective: GroupObjectiveConfig | None = None
 
     @classmethod
     def from_mapping(cls, canonical: Mapping[str, Any]) -> "TrainingConfig":
@@ -1533,6 +1604,14 @@ class TrainingConfig:
                 "dynamic_label with patch_discovery_mode='unlabeled' requires "
                 "force_full_supervision=true"
             )
+        group_objective = _group_objective_config(canonical)
+        if group_objective is not None:
+            # Both modes need each sample's dataset; the coordinate patches of extra_patches carry none.
+            if extra_patches.enabled:
+                raise ValueError("group_objective cannot be used with extra_patches")
+            if group_objective.mode == "pcgrad" and grad_acc_steps != 1:
+                # PCGrad combines the groups' gradients of one batch; accumulated gradients mix batches.
+                raise ValueError("group_objective.mode='pcgrad' requires grad_acc_steps=1")
         save_iterations_value = canonical.get("save_iterations") or ()
         if not isinstance(save_iterations_value, (list, tuple)):
             raise TypeError("save_iterations must be an array")
@@ -1599,6 +1678,7 @@ class TrainingConfig:
             extra_patches=extra_patches,
             force_full_supervision=force_full_supervision,
             save_iterations=save_iterations,
+            group_objective=group_objective,
         )
 
     @property
