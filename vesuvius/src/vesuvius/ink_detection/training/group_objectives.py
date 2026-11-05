@@ -31,6 +31,15 @@ no Python exception. Two GPU paths here ran only with a group objective, and bot
   k x k matrix on the CPU (:func:`pcgrad_weights`): each projected gradient is a combination of the original ones,
   so its dot products are combinations of the Gram matrix's entries. The step is the same up to float rounding.
 
+ROCm, second crash (2026-11-05): the next PCGrad fine-tune on the gpurig died in the backward pass of step 1 with
+SIGSEGV in the autograd thread, inside libgcc_s's C++ unwinder (a native error that crashed while it was thrown), with
+the GPU's memory at 96% and no other kernel message: most likely a failed GPU allocation. The groups' gradient stack
+(one model-sized float32 row per group in the batch, up to the batch size: roughly 1 GiB for reader-v3 at 8 groups) and its float64 Gram chunks were on
+the GPU, allocated before the first group's backward pass, so every backward pass ran with that much less memory than
+the plain training's. The stack, the Gram matrix and the combination are now on the CPU (:func:`gradient_stack`): the
+GPU holds one group's gradient at a time, as in the plain training. Only the combined step goes back to the GPU. The
+values are the same; the cost is one device-to-host copy of each group's gradient per step.
+
 Not done here: assigning samples to groups (the dataset's ``dataset_index`` and the config's ``dataset_groups``),
 the training loop (``train``).
 """
@@ -180,6 +189,18 @@ def gram(stack: torch.Tensor, chunk: int = GRAM_CHUNK) -> torch.Tensor:
         part = stack[:, start:start + chunk].double()
         out += part @ part.T
     return out.cpu()
+
+
+def gradient_stack(k: int, n: int, dtype: torch.dtype) -> torch.Tensor:
+    """Zeros for ``k`` flat gradients of ``n`` values, on the CPU whatever the model's device (module docstring, ROCm
+    second crash): the stack must not take GPU memory from the backward passes.
+
+    Returns:
+        (k, n) of ``dtype`` on the CPU.
+    """
+    if k < 1 or n < 1:
+        raise ValueError(f"a gradient stack needs one or more rows and values, got ({k}, {n})")
+    return torch.zeros((k, n), dtype=dtype, device="cpu")
 
 
 def pcgrad_weights(gram_matrix: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
@@ -403,9 +424,8 @@ class GroupObjective:
         dtypes = {p.dtype for p in params}
         if len(dtypes) != 1:
             raise ValueError(f"PCGrad needs parameters of one dtype, got {sorted(map(str, dtypes))}")
-        # One row per group, written in place: no per-group torch.cat and no second copy for the projection.
-        stack = torch.zeros((len(order), sum(p.numel() for p in params)), dtype=params[0].dtype,
-                            device=params[0].device)
+        # One row per group, written in place, on the CPU (module docstring, ROCm second crash).
+        stack = gradient_stack(len(order), sum(p.numel() for p in params), params[0].dtype)
         for k, group in enumerate(order):
             for p in params:
                 p.grad = None
@@ -416,6 +436,8 @@ class GroupObjective:
                 if p.grad is not None:  # a parameter this group's loss does not reach keeps its zeros
                     stack[k, offset:offset + n].copy_(p.grad.reshape(-1))
                 offset += n
+            for p in params:  # free this group's gradients on the GPU before the next group's backward pass
+                p.grad = None
         gram_matrix = gram(stack)
         self.record.add_gram(order, gram_matrix)
         combined = stack[0].clone() if len(order) == 1 else combine(stack, pcgrad_weights(gram_matrix, self.generator))
@@ -423,7 +445,7 @@ class GroupObjective:
         offset = 0
         for p in params:
             n = p.numel()
-            p.grad = combined[offset:offset + n].view_as(p).to(dtype=p.dtype).clone()
+            p.grad = combined[offset:offset + n].view_as(p).to(device=p.device, dtype=p.dtype, copy=True)
             offset += n
 
     def summary(self, step: int) -> dict:

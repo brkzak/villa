@@ -21,6 +21,7 @@ from vesuvius.ink_detection.training.group_objectives import (
     GradientAgreement,
     GroupDRO,
     GroupObjective,
+    gradient_stack,
     gram,
     group_losses,
     pcgrad,
@@ -339,3 +340,32 @@ def test_pcgrad_backward_with_a_parameter_one_group_does_not_reach():
     losses = {0: (a * 3.0).sum(), 1: (b * 5.0).sum()}
     objective.backward(losses, [a, b], lambda loss, **kw: loss.backward(**kw))
     assert a.grad.tolist() == [1.5] and b.grad.tolist() == [2.5]
+
+
+def test_pcgrad_gradient_stack_is_on_the_cpu_whatever_the_models_device():
+    """The groups' gradient stack must not take GPU memory from the backward passes: on the gpurig it was the margin
+    between a PCGrad fine-tune and a native crash at 96% GPU memory (module docstring, ROCm second crash)."""
+    params = [nn.Parameter(torch.empty(3, 2, device="meta")), nn.Parameter(torch.empty(4, device="meta"))]
+    stack = gradient_stack(5, sum(p.numel() for p in params), params[0].dtype)
+    assert stack.device.type == "cpu" and stack.shape == (5, 10) and stack.dtype == torch.float32
+    assert not bool(stack.any())
+    with pytest.raises(ValueError):
+        gradient_stack(0, 10, torch.float32)
+
+
+def test_pcgrad_backward_frees_each_groups_gradient_and_keeps_the_parameters_device_and_dtype():
+    """Each group's gradient is dropped once copied (one group's gradient at a time on the GPU), and the combined step
+    comes back in the parameters' own dtype and device."""
+    a = nn.Parameter(torch.tensor([1.0, -1.0], dtype=torch.float64))
+    objective = GroupObjective("pcgrad", ["A", "B"], ["A", "B"], dro_step_size=0.01, seed=0)
+    seen = []
+
+    def backward_fn(loss, **kw):
+        seen.append(a.grad)  # the previous group's gradient must be gone before the next backward pass
+        loss.backward(**kw)
+
+    objective.backward({0: (a * torch.tensor([1.0, 0.0], dtype=torch.float64)).sum(),
+                        1: (a * torch.tensor([0.0, 2.0], dtype=torch.float64)).sum()}, [a], backward_fn)
+    assert seen == [None, None]
+    assert a.grad.dtype == torch.float64 and a.grad.device == a.device
+    assert a.grad.tolist() == pytest.approx([0.5, 1.0])
