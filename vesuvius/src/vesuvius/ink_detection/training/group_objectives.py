@@ -19,6 +19,18 @@ objectives look at each group of a batch on its own:
   the model the same way and which pull against each other. Written to ``group_objective.json`` with the
   groups' mean losses (and GroupDRO's weights).
 
+ROCm (2026-11-05): the first PCGrad fine-tune on the gpurig's RX 7700 XT (torch 2.12.1+rocm7.2) died at step ~104
+of 4000 with SIGFPE: an integer divide by zero in libamdhip64.so's kernel-launch code (a work-group size of 0), with
+no Python exception. Two GPU paths here ran only with a group objective, and both are now gone:
+
+- A group's samples were taken with an index tensor (``x[index]``), whose backward is ``index_put_`` with
+  accumulation (with deterministic kernels, a sort-based kernel whose launch shape depends on the indices). They
+  are now taken with basic slices (:func:`_take`), whose backward is a copy into zeros: the same values.
+- PCGrad converted the full-model gradients to float64 for every pair's dot product, O(k^2) model-sized copies and
+  dots per step. It now takes the groups' Gram matrix once (:func:`gram`, chunked) and does the projection on the
+  k x k matrix on the CPU (:func:`pcgrad_weights`): each projected gradient is a combination of the original ones,
+  so its dot products are combinations of the Gram matrix's entries. The step is the same up to float rounding.
+
 Not done here: assigning samples to groups (the dataset's ``dataset_index`` and the config's ``dataset_groups``),
 the training loop (``train``).
 """
@@ -58,11 +70,34 @@ def sample_groups(dataset_index: torch.Tensor, dataset_groups: Sequence[int | No
     return torch.tensor(out, dtype=torch.long, device=dataset_index.device)
 
 
-def _select(value: Any, index: torch.Tensor) -> Any:
-    """``value`` (a tensor, or a list or tuple of them for deep supervision) with only the samples ``index``."""
+def _runs(rows: Sequence[int]) -> list[tuple[int, int]]:
+    """``rows`` (ascending sample indices) as ``[start, stop)`` runs of consecutive indices."""
+    out: list[tuple[int, int]] = []
+    for row in rows:
+        if out and out[-1][1] == row:
+            out[-1] = (out[-1][0], row + 1)
+        else:
+            out.append((row, row + 1))
+    return out
+
+
+def _take(tensor: torch.Tensor, rows: Sequence[int]) -> torch.Tensor:
+    """The samples ``rows`` (ascending, non-empty) of ``tensor``, by basic slices along the batch dimension.
+
+    Not ``tensor[index_tensor]``: that backward is ``index_put_`` with accumulation, a GPU path the plain training
+    never runs (module docstring, ROCm). A slice's backward copies into zeros; the values are the same.
+    """
+    if not rows:
+        raise ValueError("no samples to take")
+    parts = [tensor[start:stop] for start, stop in _runs(rows)]
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+
+
+def _select(value: Any, rows: Sequence[int]) -> Any:
+    """``value`` (a tensor, or a list or tuple of them for deep supervision) with only the samples ``rows``."""
     if isinstance(value, (list, tuple)):
-        return type(value)(item[index] for item in value)
-    return value[index]
+        return type(value)(_take(item, rows) for item in value)
+    return _take(value, rows)
 
 
 def group_losses(loss_fn: LossFn, predictions: Any, targets: Any, groups: torch.Tensor) -> dict[int, torch.Tensor]:
@@ -77,9 +112,10 @@ def group_losses(loss_fn: LossFn, predictions: Any, targets: Any, groups: torch.
         ``{group: scalar loss}`` for each group present, in group order.
     """
     out: dict[int, torch.Tensor] = {}
-    for group in sorted(set(groups.tolist())):
-        index = (groups == group).nonzero(as_tuple=True)[0]
-        out[int(group)] = loss_fn(_select(predictions, index), _select(targets, index))
+    per_sample = [int(g) for g in groups.reshape(-1).tolist()]
+    for group in sorted(set(per_sample)):
+        rows = [row for row, g in enumerate(per_sample) if g == group]
+        out[group] = loss_fn(_select(predictions, rows), _select(targets, rows))
     return out
 
 
@@ -120,13 +156,76 @@ class GroupDRO:
         return [float(w) for w in self.weights]
 
 
+# Columns of the gradient stack converted to float64 at a time in :func:`gram`: 2^22 columns of k groups is k x 32 MiB,
+# small next to the stack itself (k x the model's parameters in float32).
+GRAM_CHUNK = 1 << 22
+
+
+def gram(stack: torch.Tensor, chunk: int = GRAM_CHUNK) -> torch.Tensor:
+    """The Gram matrix of the rows of ``stack``: every pair's dot product, in float64.
+
+    Args:
+        stack: (k, N) float, one flat gradient per row.
+        chunk: how many columns are converted to float64 at a time (memory, not the result).
+
+    Returns:
+        (k, k) float64 on the CPU.
+    """
+    if stack.ndim != 2:
+        raise ValueError(f"gram needs a (k, N) stack, got shape {tuple(stack.shape)}")
+    k, n = stack.shape
+    # float64: a large model's sums in float32 can flip the sign of a near-zero conflict.
+    out = torch.zeros((k, k), dtype=torch.float64, device=stack.device)
+    for start in range(0, n, chunk):
+        part = stack[:, start:start + chunk].double()
+        out += part @ part.T
+    return out.cpu()
+
+
+def pcgrad_weights(gram_matrix: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """PCGrad's step as weights of the original gradients (module docstring): ``step = sum_j w_j g_j``.
+
+    The rule is the paper's: each g_i is projected against every other original g_j, in an order drawn from
+    ``generator``, and when ``p_i . g_j < 0``, ``p_i -= (p_i . g_j) / |g_j|^2 * g_j``. Each p_i stays a combination
+    ``sum_m c_m g_m``, so ``p_i . g_j = c . G[:, j]`` with G the Gram matrix; the step is the mean of the p_i. A
+    zero gradient takes no part as the other side of a projection.
+
+    Args:
+        gram_matrix: (k, k) float64, :func:`gram` of the groups' gradients.
+        generator: a CPU generator, seeded once per run; one ``randperm`` per gradient when k > 1.
+
+    Returns:
+        (k,) float64 on the CPU. One gradient gets weight 1.
+    """
+    k = int(gram_matrix.shape[0])
+    if k < 1 or gram_matrix.shape != (k, k):
+        raise ValueError(f"pcgrad needs a square Gram matrix of one or more gradients, got {tuple(gram_matrix.shape)}")
+    g = gram_matrix.to(device="cpu", dtype=torch.float64)
+    if k == 1:
+        return torch.ones(1, dtype=torch.float64)
+    norms = [float(g[j, j]) for j in range(k)]
+    weights = torch.zeros(k, dtype=torch.float64)
+    for i in range(k):
+        coeff = torch.zeros(k, dtype=torch.float64)
+        coeff[i] = 1.0
+        for j in torch.randperm(k, generator=generator).tolist():
+            if j == i or norms[j] == 0.0:
+                continue
+            dot = float(coeff @ g[:, j])
+            if dot < 0.0:
+                coeff[j] -= dot / norms[j]
+        weights += coeff
+    return weights / k
+
+
+def combine(stack: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """``sum_j weights[j] * stack[j]``: (N,) in ``stack``'s dtype and device."""
+    return weights.to(device=stack.device, dtype=stack.dtype) @ stack
+
+
 def pcgrad(grads: Sequence[torch.Tensor], generator: torch.Generator) -> torch.Tensor:
     """PCGrad's step from the groups' flat gradients (module docstring): the mean of each gradient after its
-    conflicting parts are projected out.
-
-    Each gradient g_i is projected against every other original gradient g_j, in an order drawn from
-    ``generator``: when ``g_i . g_j < 0``, ``g_i -= (g_i . g_j) / |g_j|^2 * g_j``. A zero gradient takes no part as
-    the other side of a projection.
+    conflicting parts are projected out (:func:`pcgrad_weights` on their :func:`gram`).
 
     Args:
         grads: one flat gradient per group in the batch, all the same shape, dtype and device.
@@ -145,19 +244,8 @@ def pcgrad(grads: Sequence[torch.Tensor], generator: torch.Generator) -> torch.T
         raise ValueError("pcgrad needs gradients of one shape")
     if len(grads) == 1:
         return grads[0].clone()
-    # Dot products in float64: a large model's sums in float32 can flip the sign of a near-zero conflict.
-    norms = [float(torch.dot(g.double(), g.double())) for g in grads]
-    out = torch.zeros_like(grads[0])
-    for i, g in enumerate(grads):
-        projected = g.clone()
-        for j in torch.randperm(len(grads), generator=generator).tolist():
-            if j == i or norms[j] == 0.0:
-                continue
-            dot = float(torch.dot(projected.double(), grads[j].double()))
-            if dot < 0.0:
-                projected -= (dot / norms[j]) * grads[j]
-        out += projected
-    return out / len(grads)
+    stack = torch.stack([g.reshape(-1) for g in grads])
+    return combine(stack, pcgrad_weights(gram(stack), generator)).view(shape)
 
 
 def cosine(a: torch.Tensor, b: torch.Tensor) -> float | None:
@@ -193,11 +281,20 @@ class GradientAgreement:
     def add_gradients(self, grads: dict[int, torch.Tensor]) -> None:
         """Count the cosine of every pair of one batch's group gradients (before PCGrad's projection)."""
         present = sorted(grads)
-        for x, i in enumerate(present):
-            for j in present[x + 1:]:
-                value = cosine(grads[i], grads[j])
-                if value is None:
+        if present:
+            self.add_gram(present, gram(torch.stack([grads[g].reshape(-1) for g in present])))
+
+    def add_gram(self, present: Sequence[int], gram_matrix: torch.Tensor) -> None:
+        """:meth:`add_gradients` from the batch's Gram matrix: row r of ``gram_matrix`` is group ``present[r]``.
+        A group whose gradient is not finite (its squared norm is not) takes no part, as a zero one."""
+        g = gram_matrix.to(device="cpu", dtype=torch.float64)
+        norms = [float(g[r, r]) for r in range(len(present))]
+        for x in range(len(present)):
+            for y in range(x + 1, len(present)):
+                i, j = present[x], present[y]
+                if not (math.isfinite(norms[x]) and math.isfinite(norms[y])) or norms[x] == 0.0 or norms[y] == 0.0:
                     continue
+                value = float(g[x, y]) / math.sqrt(norms[x] * norms[y])
                 for a, b in ((i, j), (j, i)):
                     self.pairs[a][b] += 1
                     self.cos_sum[a][b] += value
@@ -302,17 +399,27 @@ class GroupObjective:
         params = [p for p in parameters if p.requires_grad]
         if any(p.grad is not None and bool(p.grad.any()) for p in params):
             raise ValueError("PCGrad needs zeroed gradients before the batch")
-        flat: dict[int, torch.Tensor] = {}
         order = sorted(losses)
+        dtypes = {p.dtype for p in params}
+        if len(dtypes) != 1:
+            raise ValueError(f"PCGrad needs parameters of one dtype, got {sorted(map(str, dtypes))}")
+        # One row per group, written in place: no per-group torch.cat and no second copy for the projection.
+        stack = torch.zeros((len(order), sum(p.numel() for p in params)), dtype=params[0].dtype,
+                            device=params[0].device)
         for k, group in enumerate(order):
             for p in params:
                 p.grad = None
             backward_fn(losses[group], retain_graph=k < len(order) - 1)
-            flat[group] = torch.cat([
-                (p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1) for p in params
-            ])
-        self.record.add_gradients({g: v for g, v in flat.items() if bool(torch.isfinite(v).all())})
-        combined = pcgrad([flat[g] for g in order], self.generator)
+            offset = 0
+            for p in params:
+                n = p.numel()
+                if p.grad is not None:  # a parameter this group's loss does not reach keeps its zeros
+                    stack[k, offset:offset + n].copy_(p.grad.reshape(-1))
+                offset += n
+        gram_matrix = gram(stack)
+        self.record.add_gram(order, gram_matrix)
+        combined = stack[0].clone() if len(order) == 1 else combine(stack, pcgrad_weights(gram_matrix, self.generator))
+        del stack
         offset = 0
         for p in params:
             n = p.numel()

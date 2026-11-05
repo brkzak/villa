@@ -21,6 +21,7 @@ from vesuvius.ink_detection.training.group_objectives import (
     GradientAgreement,
     GroupDRO,
     GroupObjective,
+    gram,
     group_losses,
     pcgrad,
     sample_groups,
@@ -261,3 +262,80 @@ def test_real_training_entry_writes_the_group_record(tmp_path: Path, monkeypatch
         assert sum(g["dro_weight"] for g in record["groups"]) == pytest.approx(1.0)
         # B's tiles are brighter, so its loss is higher and its weight grows.
         assert record["groups"][1]["dro_weight"] > record["groups"][0]["dro_weight"]
+
+
+def _reference_pcgrad(grads, generator):
+    """The first PCGrad (2026-11-04): the paper's loop on the full gradients, every dot product on them."""
+    if len(grads) == 1:
+        return grads[0].clone()
+    norms = [float(torch.dot(g.double(), g.double())) for g in grads]
+    out = torch.zeros_like(grads[0])
+    for i, g in enumerate(grads):
+        projected = g.clone()
+        for j in torch.randperm(len(grads), generator=generator).tolist():
+            if j == i or norms[j] == 0.0:
+                continue
+            dot = float(torch.dot(projected.double(), grads[j].double()))
+            if dot < 0.0:
+                projected -= (dot / norms[j]) * grads[j]
+        out += projected
+    return out / len(grads)
+
+
+@pytest.mark.parametrize("k", [2, 3, 8])
+def test_pcgrad_on_the_gram_matrix_gives_the_papers_step(k):
+    """PCGrad now projects on the k x k Gram matrix (fewer GPU ops; the ROCm SIGFPE of 2026-11-05). The step and
+    the generator's draws must stay those of the paper's loop on the full gradients, including a zero gradient."""
+    data = torch.Generator().manual_seed(k)
+    grads = [torch.randn(257, generator=data) for _ in range(k)]
+    grads[-1] = -0.7 * grads[0] + 0.1 * grads[-1]  # a strong conflict
+    if k > 2:
+        grads[1] = torch.zeros(257)
+    new_gen, ref_gen = torch.Generator().manual_seed(11), torch.Generator().manual_seed(11)
+    torch.testing.assert_close(pcgrad(grads, new_gen), _reference_pcgrad(grads, ref_gen), rtol=1e-5, atol=1e-6)
+    # The same number of draws: the next step's order is unchanged too.
+    assert torch.randperm(5, generator=new_gen).tolist() == torch.randperm(5, generator=ref_gen).tolist()
+
+
+def test_gram_is_the_same_in_chunks():
+    """The Gram matrix is summed over column chunks to bound memory; the chunk size must not change it."""
+    stack = torch.randn(4, 1003, generator=torch.Generator().manual_seed(0))
+    torch.testing.assert_close(gram(stack, chunk=100), (stack.double() @ stack.double().T))
+
+
+def test_group_losses_take_samples_by_slices_not_an_index_tensor():
+    """A group's samples are taken by basic slices: the same values, and a backward without index_put_ (the GPU path
+    the plain training never runs; module docstring, ROCm)."""
+    x = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2).requires_grad_()
+    groups = torch.tensor([1, 0, 1, 1, 0, 1])
+    seen = {}
+
+    def loss_fn(pred, target):
+        seen[len(seen)] = pred
+        return (pred * target).sum()
+
+    losses = group_losses(loss_fn, x, x.detach(), groups)
+    torch.testing.assert_close(seen[0], x[[1, 4]])
+    torch.testing.assert_close(seen[1], x[[0, 2, 3, 5]])
+
+    def ops(fn, out):
+        if fn is None or fn in out:
+            return out
+        out.add(fn)
+        for nxt, _ in fn.next_functions:
+            ops(nxt, out)
+        return out
+
+    names = {type(fn).__name__ for loss in losses.values() for fn in ops(loss.grad_fn, set())}
+    assert not any("Index" in name for name in names), names
+    sum(losses.values()).backward()
+    torch.testing.assert_close(x.grad, x.detach())
+
+
+def test_pcgrad_backward_with_a_parameter_one_group_does_not_reach():
+    """A parameter outside one group's graph keeps a zero row in that group's gradient, as before."""
+    a, b = nn.Parameter(torch.tensor([1.0])), nn.Parameter(torch.tensor([2.0]))
+    objective = GroupObjective("pcgrad", ["A", "B"], ["A", "B"], dro_step_size=0.01, seed=0)
+    losses = {0: (a * 3.0).sum(), 1: (b * 5.0).sum()}
+    objective.backward(losses, [a, b], lambda loss, **kw: loss.backward(**kw))
+    assert a.grad.tolist() == [1.5] and b.grad.tolist() == [2.5]
