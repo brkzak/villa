@@ -1050,6 +1050,19 @@ class LossTermConfig:
     dice_label_smoothing: float
     bce_label_smoothing: float
     bce_kwargs: Mapping[str, Any]
+    # Per-pixel BCE weights of ink and labelled background pixels (losses.LabelSmoothedDCAndBCELoss); 1.0 is none.
+    bce_ink_weight: float = 1.0
+    bce_background_weight: float = 1.0
+
+
+def _class_weight(
+    term: Mapping[str, Any], authored: Mapping[str, Any], key: str, index: int
+) -> float:
+    """A loss term's per-pixel BCE class weight: the term's own, else the config's top-level one, else 1.0."""
+    value = float(term.get(key, authored.get(key, 1.0)))
+    if not (math.isfinite(value) and value > 0.0):
+        raise ValueError(f"loss.terms[{index}].{key} must be a finite number above 0, got {value}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -1084,6 +1097,11 @@ class LossConfig:
                             authored.get("bce_label_smoothing", 0.0),
                         )
                     ),
+                    **{
+                        key: float(raw_loss[key])
+                        for key in ("bce_ink_weight", "bce_background_weight")
+                        if key in raw_loss
+                    },
                 }
             ]
         else:
@@ -1145,6 +1163,10 @@ class LossConfig:
                             str(key): _freeze_json(item)
                             for key, item in bce_kwargs.items()
                         }
+                    ),
+                    bce_ink_weight=_class_weight(value, authored, "bce_ink_weight", index),
+                    bce_background_weight=_class_weight(
+                        value, authored, "bce_background_weight", index
                     ),
                 )
             )

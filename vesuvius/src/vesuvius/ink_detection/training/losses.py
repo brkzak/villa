@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -12,15 +13,47 @@ from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 
 
 class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
-    """Combine Dice and BCE with optional smoothing of BCE targets."""
+    """Combine Dice and BCE with optional smoothing of BCE targets.
 
-    def __init__(self, *args, bce_label_smoothing: float = 0.0, **kwargs):
+    ``bce_ink_weight`` and ``bce_background_weight`` scale each supervised pixel's BCE by its label: ink pixels by the
+    first, labelled background pixels by the second (a soft label in between is weighted linearly). The mean stays
+    over the supervised pixels, so weights above 1 also make the BCE term larger. They weight pixels by their label,
+    not the two terms of the BCE as ``torch.nn.BCEWithLogitsLoss(pos_weight=...)`` does: with smoothed targets
+    (0.25 / 0.75) every pixel carries both terms, and a ``pos_weight`` of 3 would move the best prediction on a
+    background pixel from 0.25 to 0.5. A per-pixel weight keeps each pixel's best prediction at its smoothed target
+    and only changes how much the errors of one class count against the other. The Dice term is not weighted. Both
+    1.0 (the default) is the unweighted loss, bit for bit.
+    """
+
+    def __init__(
+        self,
+        *args,
+        bce_label_smoothing: float = 0.0,
+        bce_ink_weight: float = 1.0,
+        bce_background_weight: float = 1.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         if not 0.0 <= bce_label_smoothing <= 1.0:
             raise ValueError(
                 f"bce_label_smoothing must be between 0 and 1, got {bce_label_smoothing}"
             )
+        for name, value in (
+            ("bce_ink_weight", bce_ink_weight),
+            ("bce_background_weight", bce_background_weight),
+        ):
+            if not (math.isfinite(float(value)) and float(value) > 0.0):
+                raise ValueError(f"{name} must be a finite number above 0, got {value}")
         self.bce_label_smoothing = float(bce_label_smoothing)
+        self.bce_ink_weight = float(bce_ink_weight)
+        self.bce_background_weight = float(bce_background_weight)
+
+    def _class_weights(self, target_regions: torch.Tensor) -> torch.Tensor | None:
+        """Per-pixel BCE weights from the unsmoothed label (None when both weights are 1: no multiply at all)."""
+        if self.bce_ink_weight == 1.0 and self.bce_background_weight == 1.0:
+            return None
+        target = target_regions.float()
+        return self.bce_background_weight + (self.bce_ink_weight - self.bce_background_weight) * target
 
     def _smooth_bce_targets(self, target_regions: torch.Tensor) -> torch.Tensor:
         target_regions = target_regions.float()
@@ -46,9 +79,15 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
 
         dc_loss = self.dc(net_output, target_regions, loss_mask=mask)
         smoothed_targets = self._smooth_bce_targets(target_regions)
+        weights = self._class_weights(target_regions)
         if mask is not None:
             denom = torch.clip(mask.sum(), min=1e-8)
-            ce_loss = (self.ce(net_output, smoothed_targets) * mask).sum() / denom
+            pixel_ce = self.ce(net_output, smoothed_targets)
+            if weights is not None:
+                pixel_ce = pixel_ce * weights
+            ce_loss = (pixel_ce * mask).sum() / denom
+        elif weights is not None:
+            raise ValueError("bce_ink_weight / bce_background_weight need per-pixel BCE (use_ignore_label or a mask)")
         else:
             ce_loss = self.ce(net_output, smoothed_targets)
         return self.weight_ce * ce_loss + self.weight_dice * dc_loss
@@ -156,6 +195,8 @@ def create_loss(config: InkConfig) -> CompositeLoss:
             weight_ce=term.weight_ce,
             use_ignore_label=True,
             bce_label_smoothing=term.bce_label_smoothing,
+            bce_ink_weight=term.bce_ink_weight,
+            bce_background_weight=term.bce_background_weight,
         )
         terms.append(
             WeightedLossTerm(

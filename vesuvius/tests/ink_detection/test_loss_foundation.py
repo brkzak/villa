@@ -185,3 +185,93 @@ def test_configured_composite_retains_term_weights_and_smoothing():
     assert loss.terms[0].metric_name == "ink base"
     assert loss.terms[0].module.weight_ce == 0.5
     assert loss.terms[0].module.bce_label_smoothing == 0.5
+
+
+def _class_weighted_bce(ink: float, background: float):
+    return LabelSmoothedDCAndBCELoss(
+        bce_kwargs={},
+        soft_dice_kwargs={"label_smoothing": 0.0},
+        weight_dice=0.0,
+        weight_ce=1.0,
+        use_ignore_label=True,
+        bce_label_smoothing=0.5,
+        bce_ink_weight=ink,
+        bce_background_weight=background,
+    )
+
+
+def test_unit_class_weights_leave_the_loss_bit_for_bit_unchanged():
+    """Weights of 1.0 must be the old loss exactly: every run before the weights existed trained with it."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 1, 4, 4)
+    target = torch.cat(
+        [(torch.rand(2, 1, 4, 4) > 0.7).float(), (torch.rand(2, 1, 4, 4) > 0.8).float()], dim=1
+    )
+
+    plain = _smoothed_bce_loss()(logits, target)
+    weighted = _class_weighted_bce(1.0, 1.0)(logits, target)
+
+    assert torch.equal(plain, weighted)
+
+
+def test_class_weights_scale_each_pixel_by_its_label_over_the_supervised_mean():
+    """An ink pixel's BCE counts ink_weight times, a background pixel's background_weight times, and the mean stays
+    over the supervised pixels (an ignored pixel adds nothing, whatever its label)."""
+    logits = torch.tensor([[[[0.3, -1.2, 2.0]]]])
+    labels = torch.tensor([[[[1.0, 0.0, 1.0]]]])
+    ignore = torch.tensor([[[[0.0, 0.0, 1.0]]]])
+    target = torch.cat([labels, ignore], dim=1)
+
+    actual = _class_weighted_bce(3.0, 2.0)(logits, target)
+
+    t = labels * 0.5 + 0.25
+    pixel = nn.functional.binary_cross_entropy_with_logits(logits, t, reduction="none")
+    expected = (3.0 * pixel[..., 0] + 2.0 * pixel[..., 1]).sum() / 2.0
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_class_weights_keep_the_best_prediction_at_the_smoothed_target():
+    """Unlike torch's pos_weight, a per-pixel weight must not move a background pixel's optimum off 0.25: the
+    gradient at p = t is zero for any weight."""
+    logit = torch.tensor([[[[math.log(0.25 / 0.75)]]]], requires_grad=True)
+    target = torch.tensor([[[[0.0]], [[0.0]]]])
+
+    _class_weighted_bce(3.0, 5.0)(logit, target).backward()
+
+    assert abs(float(logit.grad)) < 1e-6
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
+def test_class_weights_reject_values_that_are_not_positive_and_finite(value):
+    """A zero, negative or infinite weight would silently drop or blow up a class: refuse it at construction."""
+    with pytest.raises(ValueError):
+        _class_weighted_bce(value, 1.0)
+    with pytest.raises(ValueError):
+        _class_weighted_bce(1.0, value)
+
+
+def test_configured_class_weights_reach_the_loss_from_the_top_level_and_the_term():
+    """A config's top-level bce_ink_weight / bce_background_weight apply to every term; a term's own wins."""
+    authored = _config_mapping()
+    authored["bce_ink_weight"] = 3.0
+    authored["bce_background_weight"] = 2.0
+    authored["loss"] = {
+        "terms": [
+            {"name": "LabelSmoothedDCAndBCELoss", "metric_name": "a"},
+            {"name": "LabelSmoothedDCAndBCELoss", "metric_name": "b", "bce_background_weight": 4.0},
+        ]
+    }
+
+    loss = create_loss(InkConfig.from_mapping(authored))
+
+    assert loss.terms[0].module.bce_ink_weight == 3.0
+    assert loss.terms[0].module.bce_background_weight == 2.0
+    assert loss.terms[1].module.bce_background_weight == 4.0
+
+
+def test_configs_without_class_weights_train_unweighted():
+    """A config written before the weights existed has none, and must build the unweighted loss."""
+    loss = create_loss(InkConfig.from_mapping(_config_mapping()))
+
+    assert loss.terms[0].module.bce_ink_weight == 1.0
+    assert loss.terms[0].module.bce_background_weight == 1.0
