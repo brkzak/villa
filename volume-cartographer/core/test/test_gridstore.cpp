@@ -173,6 +173,51 @@ TEST_CASE("save / load round-trips data")
     std::filesystem::remove(path);
 }
 
+TEST_CASE("getShared returns what get(center, radius) returns, also when repeated")
+{
+    const auto path = tmpPath("get_shared.bin");
+    std::filesystem::remove(path);
+    {
+        GridStore gs(cv::Rect(0, 0, 400, 400), 10);
+        for (int i = 0; i < 40; ++i) {
+            gs.add(diagonal(12, 1, 0, {(i * 37) % 380, (i * 53) % 380}));
+        }
+        gs.save(path);
+    }
+    GridStore loaded(path);
+
+    // Enough distinct queries to wrap the remembered slots several times, each
+    // asked twice in a row and again after the others.
+    std::vector<cv::Point2f> centers;
+    for (int i = 0; i < 300; ++i) {
+        centers.emplace_back(static_cast<float>((i * 13) % 400) + 0.25f, static_cast<float>((i * 29) % 400) + 0.5f);
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        for (const auto& c : centers) {
+            const auto expected = loaded.get(c, 20.0f);
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                const auto shared = loaded.getShared(c, 20.0f);
+                REQUIRE(shared != nullptr);
+                REQUIRE(shared->size() == expected.size());
+                for (size_t k = 0; k < expected.size(); ++k) {
+                    CHECK(*(*shared)[k] == *expected[k]);
+                }
+            }
+        }
+    }
+
+    // A repeated query is served from the remembered answer.
+    const auto first = loaded.getShared(centers[0], 20.0f);
+    CHECK(loaded.getShared(centers[0], 20.0f) == first);
+
+    // An in-memory store answers too (without remembering).
+    GridStore mem(cv::Rect(0, 0, 100, 100), 10);
+    mem.add(diagonal(5));
+    CHECK(mem.getShared(cv::Point2f(2, 2), 3.0f)->size() == mem.get(cv::Point2f(2, 2), 3.0f).size());
+
+    std::filesystem::remove(path);
+}
+
 TEST_CASE("save with default options compiles & roundtrips")
 {
     const auto path = tmpPath("save_default.bin");

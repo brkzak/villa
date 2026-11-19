@@ -240,3 +240,27 @@ TEST_CASE("get_grid with a real (committed) GridStore file is read back")
     CHECK(stats_after.gridHits > stats_before.gridHits);
     fs::remove_all(d);
 }
+
+TEST_CASE("nearest_slice_index names the slice query_nearest reads")
+{
+    auto d = makeEmptyNgvDir("nearest_slice", /*sparseVolume=*/4);
+    {
+        vc::core::util::GridStore gs(cv::Rect(0, 0, 100, 100), 10);
+        gs.add({cv::Point(0, 0), cv::Point(5, 5), cv::Point(10, 10)});
+        gs.save((d / "xz" / "000008.grid").string());
+    }
+    NormalGridVolume v(d.string());
+    // Plane 1 (XZ) is indexed by y, rounded to the nearest multiple of sparse-volume.
+    CHECK(v.nearest_slice_index(cv::Point3f(0, 9.9f, 0), 1) == 8);
+    CHECK(v.nearest_slice_index(cv::Point3f(0, 6.1f, 0), 1) == 8);
+    CHECK(v.nearest_slice_index(cv::Point3f(0, 5.9f, 0), 1) == 4);
+    CHECK(v.nearest_slice_index(cv::Point3f(3, 2, 13), 0) == 12);
+    CHECK(v.nearest_slice_index(cv::Point3f(3, 2, 13), 2) == 4);
+    CHECK_FALSE(v.nearest_slice_index(cv::Point3f(0, 0, 0), 99).has_value());
+    for (float y : {5.9f, 6.1f, 9.9f}) {
+        const cv::Point3f p(0, y, 0);
+        CHECK(v.query_nearest(p, 1) == v.get_grid(1, *v.nearest_slice_index(p, 1)));
+    }
+    CHECK(v.query_nearest(cv::Point3f(0, 9.9f, 0), 1) != nullptr);
+    fs::remove_all(d);
+}

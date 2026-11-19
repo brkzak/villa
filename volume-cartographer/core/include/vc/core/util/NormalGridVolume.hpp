@@ -43,6 +43,8 @@ namespace vc::core::util {
         };
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const;
+        // The slice query_nearest() reads (std::nullopt for a bad plane_idx).
+        std::optional<int> nearest_slice_index(const cv::Point3f& point, int plane_idx) const;
         std::shared_ptr<const GridStore> query_nearest(const cv::Point3f& point, int plane_idx) const;
         std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const;
         CacheStats cacheStats() const;

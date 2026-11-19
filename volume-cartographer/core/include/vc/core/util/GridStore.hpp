@@ -35,6 +35,11 @@ public:
     void add(const std::vector<cv::Point>& points);
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const;
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Point2f& center, float radius) const;
+    using PathList = std::vector<std::shared_ptr<std::vector<cv::Point>>>;
+    // The paths get(center, radius) returns, without the copy. A store
+    // loaded from a file remembers its recent answers, so a repeated query
+    // is a lookup.
+    std::shared_ptr<const PathList> getShared(const cv::Point2f& center, float radius) const;
     void forEach(const cv::Rect& query_rect,
                  QueryScratch& scratch,
                  const std::function<void(const std::shared_ptr<std::vector<cv::Point>>&)>& visitor) const;

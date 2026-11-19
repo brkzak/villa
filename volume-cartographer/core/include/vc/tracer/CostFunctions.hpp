@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <limits>
+#include <optional>
 #include <utility>
 
 
@@ -1069,7 +1071,11 @@ struct NormalConstraintPlane {
          bool best_is_next = false;
      };
      mutable std::array<PointPairCache<SnapLossPayload>, 2> snap_loss_caches_;
- 
+
+     // The grid of the slice last queried (see operator()).
+     mutable int grid_slice_idx_ = std::numeric_limits<int>::min();
+     mutable std::shared_ptr<const vc::core::util::GridStore> grid_;
+
      const float cache_radius_normal_ = 16.0f;
      const float cache_radius_snap_ = 1.0f;
      const float roi_radius_ = 64.0f;
@@ -1187,7 +1193,17 @@ struct NormalConstraintPlane {
         // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_query->grid2, 1);
         // T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
-        auto grid_ptr = normal_grid_volume.query_nearest(query_point, plane_idx);
+        // As query_nearest(), but the grid is looked up only when the slice
+        // changes: Ceres evaluates this residual many times per solve, mostly
+        // on the same slice.
+        const std::optional<int> slice_idx = normal_grid_volume.nearest_slice_index(query_point, plane_idx);
+        if (!slice_idx)
+            return true;
+        if (*slice_idx != grid_slice_idx_) {
+            grid_ = normal_grid_volume.get_grid(plane_idx, *slice_idx);
+            grid_slice_idx_ = *slice_idx;
+        }
+        const vc::core::util::GridStore* grid_ptr = grid_.get();
         if (!grid_ptr)
             return true;
 
@@ -1322,8 +1338,8 @@ struct NormalConstraintPlane {
 
         if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
-            auto raw_paths = normal_grid.get(midpoint_cv, query_radius_);
-            auto filtered_paths = filter_and_split_paths(raw_paths, p1_cv, p2_cv);
+            auto raw_paths = normal_grid.getShared(midpoint_cv, query_radius_);
+            auto filtered_paths = filter_and_split_paths(*raw_paths, p1_cv, p2_cv);
             fill_segment_normals(filtered_paths, segment_normals_[grid_idx]);
             path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume);
             // Invalidate snapping cache whenever the path cache is updated
