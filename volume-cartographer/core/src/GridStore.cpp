@@ -1,6 +1,7 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -193,6 +194,37 @@ public:
         return std::move(scratch.results);
     }
 
+    // get() for a mapped store, remembering the answers to recent queries.
+    // The tracer's normal-grid residuals ask the same rect again and again:
+    // every local solve builds its residuals afresh, and their first
+    // evaluation queries the paths around the same, unchanged quads as the
+    // solve before. On a 120-generation PHerc0125 grow, 68 % of 11.7 M queries
+    // repeated an earlier one on the same store; 64 direct-mapped slots catch
+    // 61 % (256 slots: 66 %), and each hit skips collect_query_results' bucket,
+    // seglist and polyline lookups (three mutexes per path returned). A mapped
+    // store never changes, so a remembered answer is the answer get() gives.
+    std::shared_ptr<const GridStore::PathList> get_shared(const cv::Rect& query_rect) const {
+        if (!read_only_) {
+            return std::make_shared<const GridStore::PathList>(get(query_rect));
+        }
+        const size_t slot = query_memo_slot(query_rect);
+        {
+            std::lock_guard<std::mutex> lock(query_memo_mutex_);
+            const QueryMemoEntry& entry = query_memo_[slot];
+            if (entry.paths && entry.rect == query_rect) {
+                return entry.paths;
+            }
+        }
+        auto paths = std::make_shared<const GridStore::PathList>(get(query_rect));
+        std::lock_guard<std::mutex> lock(query_memo_mutex_);
+        QueryMemoEntry& entry = query_memo_[slot];
+        query_memo_bytes_.fetch_sub(query_memo_entry_bytes(entry.paths.get()), std::memory_order_relaxed);
+        entry.rect = query_rect;
+        entry.paths = paths;
+        query_memo_bytes_.fetch_add(query_memo_entry_bytes(paths.get()), std::memory_order_relaxed);
+        return paths;
+    }
+
     void forEach(
         const cv::Rect& query_rect,
         GridStore::QueryScratch& scratch,
@@ -239,7 +271,8 @@ public:
         }
         size_t storage_memory = 0;
         if (read_only_) {
-            storage_memory = seglist_cache_bytes_.load(std::memory_order_relaxed);
+            storage_memory = seglist_cache_bytes_.load(std::memory_order_relaxed)
+                           + query_memo_bytes_.load(std::memory_order_relaxed);
         } else {
             storage_memory = storage_.capacity() * sizeof(std::shared_ptr<LineSegList>);
             for (const auto& seg : storage_) {
@@ -877,6 +910,29 @@ private:
     mutable std::mutex seglist_mutex_;
     mutable std::unordered_map<size_t, SegCacheEntry> seglist_cache_;
     mutable std::atomic<size_t> seglist_cache_bytes_{0};
+    static constexpr size_t kHeapBlockOverhead = 16;
+    // get_shared()'s remembered queries. Charged for the lists themselves;
+    // the polylines they point to are the decoded seglists, already charged
+    // above while cached (a list can keep one alive after its seglist is
+    // evicted, at most the paths of the last kQueryMemoSlots queries).
+    static constexpr size_t kQueryMemoSlots = 64;
+    struct QueryMemoEntry {
+        cv::Rect rect;
+        std::shared_ptr<const GridStore::PathList> paths;
+    };
+    static size_t query_memo_slot(const cv::Rect& r) {
+        const uint64_t h = (static_cast<uint64_t>(static_cast<uint32_t>(r.x)) * 73856093u)
+                         ^ (static_cast<uint64_t>(static_cast<uint32_t>(r.y)) * 19349663u)
+                         ^ (static_cast<uint64_t>(static_cast<uint32_t>(r.width)) * 83492791u)
+                         ^ (static_cast<uint64_t>(static_cast<uint32_t>(r.height)) * 2654435761u);
+        return static_cast<size_t>(h % kQueryMemoSlots);
+    }
+    static size_t query_memo_entry_bytes(const GridStore::PathList* paths) {
+        return paths ? paths->capacity() * sizeof(GridStore::PathList::value_type) + 2 * kHeapBlockOverhead : 0;
+    }
+    mutable std::mutex query_memo_mutex_;
+    mutable std::array<QueryMemoEntry, kQueryMemoSlots> query_memo_;
+    mutable std::atomic<size_t> query_memo_bytes_{0};
     mutable std::atomic<uint64_t> decoded_path_hits_{0};
     mutable std::atomic<uint64_t> decoded_path_misses_{0};
     mutable std::atomic<uint64_t> decoded_path_evictions_{0};
@@ -910,6 +966,13 @@ std::vector<std::shared_ptr<std::vector<cv::Point>>> GridStore::get(const cv::Po
     int y = static_cast<int>(center.y - radius);
     int size = static_cast<int>(radius * 2);
     return get(cv::Rect(x, y, size, size));
+}
+
+std::shared_ptr<const GridStore::PathList> GridStore::getShared(const cv::Point2f& center, float radius) const {
+    int x = static_cast<int>(center.x - radius);
+    int y = static_cast<int>(center.y - radius);
+    int size = static_cast<int>(radius * 2);
+    return pimpl_->get_shared(cv::Rect(x, y, size, size));
 }
 
 void GridStore::forEach(
