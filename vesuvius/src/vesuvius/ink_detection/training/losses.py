@@ -11,6 +11,11 @@ from torch import nn
 from vesuvius.ink_detection.config import InkConfig
 from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 
+# The target value of an unlabeled pixel for the PU loss (LabelSmoothedDCAndBCELoss, PU loss). train.prepare_loss_inputs
+# writes it with the pixel's ignore flag set, so every other user of the targets (Dice, metrics, previews) leaves the
+# pixel out as before; 0.5 survives the nearest-neighbour downsampling of deep supervision and is never a hard label.
+PU_UNLABELED_TARGET = 0.5
+
 
 class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
     """Combine Dice and BCE with optional smoothing of BCE targets.
@@ -23,6 +28,22 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
     background pixel from 0.25 to 0.5. A per-pixel weight keeps each pixel's best prediction at its smoothed target
     and only changes how much the errors of one class count against the other. The Dice term is not weighted. Both
     1.0 (the default) is the unweighted loss, bit for bit.
+
+    PU loss (``pu_prior``, positive-unlabeled learning): a pixel can be labelled ink (P), labelled not ink (N), or
+    unlabeled (U): ignored, with the target :data:`PU_UNLABELED_TARGET` (``train.prepare_loss_inputs``). Of U, a share
+    ``pu_prior`` is ink, but which pixels is unknown. The BCE then counts every U pixel at the non-negative PU risk
+    of Kiryo et al. 2017 (nnPU), taken over the whole batch:
+
+        R_U = prior * mean_P l+  +  |mean_U l-  -  prior * mean_P l-|
+
+    ``l+`` / ``l-`` is a pixel's BCE against the (smoothed) ink / not-ink target, times the ink / background weight.
+    ``mean_U l- - prior * mean_P l-`` estimates the loss of U's not-ink pixels from U and P alone; it assumes the
+    labelled ink looks like the ink hidden in U. When the model overfits, that estimate falls below 0 (it cannot be in
+    truth); the absolute value then reverses its gradient (nnPU's defence with beta 0, gamma 1) instead of driving it
+    lower. The BCE is ``(sum over P and N of the pixel BCE + |U| * R_U) / (|P| + |N| + |U|)``, so a U pixel weighs as
+    much as a labelled one. A batch without a P pixel or without a U pixel has no estimate; its U pixels then add
+    nothing and the BCE is the labelled pixels' mean, as without PU. The Dice term never sees U. None (the default)
+    is the loss without PU, bit for bit.
     """
 
     def __init__(
@@ -31,6 +52,7 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
         bce_label_smoothing: float = 0.0,
         bce_ink_weight: float = 1.0,
         bce_background_weight: float = 1.0,
+        pu_prior: float | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -44,9 +66,39 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
         ):
             if not (math.isfinite(float(value)) and float(value) > 0.0):
                 raise ValueError(f"{name} must be a finite number above 0, got {value}")
+        if pu_prior is not None and not (math.isfinite(float(pu_prior)) and 0.0 < float(pu_prior) < 1.0):
+            raise ValueError(f"pu_prior must be strictly between 0 and 1, got {pu_prior}")
+        if pu_prior is not None and not self.use_ignore_label:
+            raise ValueError("pu_prior needs the ignore channel (use_ignore_label): it carries the unlabeled pixels")
         self.bce_label_smoothing = float(bce_label_smoothing)
         self.bce_ink_weight = float(bce_ink_weight)
         self.bce_background_weight = float(bce_background_weight)
+        self.pu_prior = None if pu_prior is None else float(pu_prior)
+
+    def _pu_bce_sum(
+        self, net_output: torch.Tensor, target_regions: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The U pixels' part of the BCE (class docstring, PU loss): ``(|U| * R_U, |U|)``, both 0 when the batch has
+        no P or no U pixel."""
+        unlabeled = (~mask) & (target_regions == PU_UNLABELED_TARGET)
+        positive = mask & (target_regions == 1)
+        # Counts stay tensors (no host sync per step); a missing P or U zeroes the result through ``present``.
+        n_unlabeled = unlabeled.sum().to(net_output.dtype)
+        n_positive = positive.sum().to(net_output.dtype)
+        present = ((n_unlabeled > 0) & (n_positive > 0)).to(net_output.dtype)
+        n_unlabeled_safe = torch.clip(n_unlabeled, min=1.0)
+        n_positive_safe = torch.clip(n_positive, min=1.0)
+        ink_target = self._smooth_bce_targets(torch.ones_like(target_regions))
+        papyrus_target = self._smooth_bce_targets(torch.zeros_like(target_regions))
+        loss_as_ink = self.ce(net_output, ink_target) * self.bce_ink_weight
+        loss_as_papyrus = self.ce(net_output, papyrus_target) * self.bce_background_weight
+        positive_f, unlabeled_f = positive.float(), unlabeled.float()
+        risk_p_ink = (loss_as_ink * positive_f).sum() / n_positive_safe
+        risk_p_papyrus = (loss_as_papyrus * positive_f).sum() / n_positive_safe
+        risk_u_papyrus = (loss_as_papyrus * unlabeled_f).sum() / n_unlabeled_safe
+        negative = risk_u_papyrus - self.pu_prior * risk_p_papyrus
+        risk_u = self.pu_prior * risk_p_ink + negative.abs()
+        return risk_u * n_unlabeled * present, n_unlabeled * present
 
     def _class_weights(self, target_regions: torch.Tensor) -> torch.Tensor | None:
         """Per-pixel BCE weights from the unsmoothed label (None when both weights are 1: no multiply at all)."""
@@ -81,11 +133,16 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
         smoothed_targets = self._smooth_bce_targets(target_regions)
         weights = self._class_weights(target_regions)
         if mask is not None:
-            denom = torch.clip(mask.sum(), min=1e-8)
             pixel_ce = self.ce(net_output, smoothed_targets)
             if weights is not None:
                 pixel_ce = pixel_ce * weights
-            ce_loss = (pixel_ce * mask).sum() / denom
+            if self.pu_prior is None:
+                denom = torch.clip(mask.sum(), min=1e-8)
+                ce_loss = (pixel_ce * mask).sum() / denom
+            else:
+                unlabeled_sum, n_unlabeled = self._pu_bce_sum(net_output, target_regions, mask)
+                denom = torch.clip(mask.sum() + n_unlabeled, min=1e-8)
+                ce_loss = ((pixel_ce * mask).sum() + unlabeled_sum) / denom
         elif weights is not None:
             raise ValueError("bce_ink_weight / bce_background_weight need per-pixel BCE (use_ignore_label or a mask)")
         else:
@@ -197,6 +254,7 @@ def create_loss(config: InkConfig) -> CompositeLoss:
             bce_label_smoothing=term.bce_label_smoothing,
             bce_ink_weight=term.bce_ink_weight,
             bce_background_weight=term.bce_background_weight,
+            pu_prior=term.pu_prior,
         )
         terms.append(
             WeightedLossTerm(

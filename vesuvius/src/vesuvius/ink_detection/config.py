@@ -1053,6 +1053,34 @@ class LossTermConfig:
     # Per-pixel BCE weights of ink and labelled background pixels (losses.LabelSmoothedDCAndBCELoss); 1.0 is none.
     bce_ink_weight: float = 1.0
     bce_background_weight: float = 1.0
+    # Positive-unlabeled BCE (losses.LabelSmoothedDCAndBCELoss, PU loss): the share of ink among the unlabeled pixels,
+    # strictly between 0 and 1; None is the plain loss.
+    pu_prior: float | None = None
+
+
+# The ink label value that marks an unlabeled pixel for the PU loss when the config names none (``pu_unlabeled_label``):
+# midway between no ink (0) and ink (255), so it reads as neither.
+DEFAULT_PU_UNLABELED_LABEL = 128
+
+
+def _pu_prior(term: Mapping[str, Any], authored: Mapping[str, Any], index: int) -> float | None:
+    """A loss term's PU prior: the term's own ``pu_prior``, else the config's top-level one, else None (no PU)."""
+    value = term.get("pu_prior", authored.get("pu_prior"))
+    if value is None:
+        return None
+    value = float(value)
+    if not (math.isfinite(value) and 0.0 < value < 1.0):
+        raise ValueError(f"loss.terms[{index}].pu_prior must be strictly between 0 and 1, got {value}")
+    return value
+
+
+def _pu_unlabeled_label(authored: Mapping[str, Any]) -> int:
+    """The ink label value that marks an unlabeled pixel (``pu_unlabeled_label``, default 128): 1 to 254, so it is
+    neither no ink (0) nor the usual ink value (255)."""
+    value = authored.get("pu_unlabeled_label", DEFAULT_PU_UNLABELED_LABEL)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 254:
+        raise ValueError(f"pu_unlabeled_label must be an integer from 1 to 254, got {value!r}")
+    return value
 
 
 def _class_weight(
@@ -1070,6 +1098,8 @@ class LossConfig:
     """The ordered active terms used by the ink segmentation objective."""
 
     terms: tuple[LossTermConfig, ...]
+    # The ink label value of an unlabeled pixel when a term has a PU prior (train.prepare_loss_inputs); None without.
+    pu_unlabeled_label: int | None = None
 
     @classmethod
     def from_mapping(cls, authored: Mapping[str, Any]) -> "LossConfig":
@@ -1099,7 +1129,7 @@ class LossConfig:
                     ),
                     **{
                         key: float(raw_loss[key])
-                        for key in ("bce_ink_weight", "bce_background_weight")
+                        for key in ("bce_ink_weight", "bce_background_weight", "pu_prior")
                         if key in raw_loss
                     },
                 }
@@ -1168,6 +1198,7 @@ class LossConfig:
                     bce_background_weight=_class_weight(
                         value, authored, "bce_background_weight", index
                     ),
+                    pu_prior=_pu_prior(value, authored, index),
                 )
             )
         if not terms:
@@ -1175,7 +1206,13 @@ class LossConfig:
                 "All configured loss terms have zero weight; "
                 "at least one active term is required"
             )
-        return cls(terms=tuple(terms))
+        pu = any(term.pu_prior is not None for term in terms)
+        if "pu_unlabeled_label" in authored and not pu:
+            raise ValueError("pu_unlabeled_label is set but no loss term has a pu_prior")
+        return cls(
+            terms=tuple(terms),
+            pu_unlabeled_label=_pu_unlabeled_label(authored) if pu else None,
+        )
 
 
 @dataclass(frozen=True)

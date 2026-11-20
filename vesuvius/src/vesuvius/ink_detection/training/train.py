@@ -35,6 +35,7 @@ from vesuvius.ink_detection.training.dilation import (
     resolve_dilation_distances,
 )
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.ink_detection.training.losses import PU_UNLABELED_TARGET
 from vesuvius.ink_detection.training.metrics import BalancedAccuracy, Confusion
 from vesuvius.ink_detection.training.stitching import run_model_forward
 from vesuvius.ink_detection.types import ConfusionCounts, MetricBatch, SamplingPolicy
@@ -128,9 +129,23 @@ def prepare_model_input(
 
 
 def prepare_loss_inputs(
-    predictions, batch, *, mode: str, force_full_supervision: bool = False
+    predictions,
+    batch,
+    *,
+    mode: str,
+    force_full_supervision: bool = False,
+    pu_unlabeled_label: int | None = None,
 ):
-    """Return float-workflow predictions, binary targets, and ignore masks."""
+    """Return float-workflow predictions, binary targets, and ignore masks.
+
+    With ``pu_unlabeled_label`` (the PU loss, ``losses.LabelSmoothedDCAndBCELoss``) a supervised pixel whose ink label
+    is that value in every layer it has ink in (the flat max over depth equals it) is unlabeled: it is ignored, as for
+    every other user of the targets, and its target is ``losses.PU_UNLABELED_TARGET``, which only the PU loss reads.
+    A layer with real ink (any other non-zero value) makes the pixel ink. Flat mode only.
+
+    Raises:
+        ValueError: ``pu_unlabeled_label`` with a full 3D mode or with ``force_full_supervision``.
+    """
 
     if isinstance(predictions, (list, tuple)):
         prepared_predictions = []
@@ -142,6 +157,7 @@ def prepare_loss_inputs(
                 batch,
                 mode=mode,
                 force_full_supervision=force_full_supervision,
+                pu_unlabeled_label=pu_unlabeled_label,
             )
             prepared_predictions.append(prepared)
             if index == 0:
@@ -149,6 +165,10 @@ def prepare_loss_inputs(
                 ignore_mask = current_ignore
         return type(predictions)(prepared_predictions), targets, ignore_mask
 
+    if pu_unlabeled_label is not None and mode in {"full_3d", "full_3d_single_wrap"}:
+        raise ValueError(f"the PU loss's unlabeled pixels are read in flat mode only, not {mode!r}")
+    if pu_unlabeled_label is not None and force_full_supervision:
+        raise ValueError("the PU loss needs the supervision mask: force_full_supervision would drop its unlabeled pixels")
     if mode in {"full_3d", "full_3d_single_wrap"}:
         crop_shape = tuple(int(value) for value in batch["image"].shape[-3:])
         if tuple(int(value) for value in predictions.shape[-3:]) != crop_shape:
@@ -166,15 +186,18 @@ def prepare_loss_inputs(
         )
         return predictions, targets, ignore_mask
 
-    targets = (torch.amax(batch["inklabels"], dim=2) > 0).to(
-        dtype=batch["inklabels"].dtype
-    )
+    flat_labels = torch.amax(batch["inklabels"], dim=2)
+    targets = (flat_labels > 0).to(dtype=batch["inklabels"].dtype)
     supervision = torch.amax(batch["supervision_mask"], dim=2)
     ignore_mask = (
         torch.zeros_like(targets)
         if force_full_supervision
         else (supervision <= 0).to(dtype=targets.dtype)
     )
+    if pu_unlabeled_label is not None:
+        unlabeled = (flat_labels == float(pu_unlabeled_label)) & (supervision > 0)
+        targets = torch.where(unlabeled, torch.full_like(targets, PU_UNLABELED_TARGET), targets)
+        ignore_mask = torch.where(unlabeled, torch.ones_like(ignore_mask), ignore_mask)
     output_size = tuple(int(value) for value in predictions.shape[-2:])
     if tuple(int(value) for value in targets.shape[-2:]) != output_size:
         targets = F.interpolate(
@@ -186,10 +209,14 @@ def prepare_loss_inputs(
     return predictions, targets, ignore_mask
 
 
-def prepare_validation_loss_inputs(predictions, batch, *, mode: str):
+def prepare_validation_loss_inputs(
+    predictions, batch, *, mode: str, pu_unlabeled_label: int | None = None
+):
     """Prepare stored validation labels without relaxing their supervision mask."""
 
-    return prepare_loss_inputs(predictions, batch, mode=mode)
+    return prepare_loss_inputs(
+        predictions, batch, mode=mode, pu_unlabeled_label=pu_unlabeled_label
+    )
 
 
 def apply_dynamic_label_substitution(batch, generator, *, kind: str) -> None:
@@ -812,6 +839,7 @@ def _run_training(request: TrainingRequest) -> int:
                 batch,
                 mode=config.ink.data.mode,
                 force_full_supervision=config.force_full_supervision,
+                pu_unlabeled_label=config.ink.loss.pu_unlabeled_label,
             )
             primary_predictions = (
                 loss_predictions[0]
@@ -1049,6 +1077,7 @@ def _run_training(request: TrainingRequest) -> int:
                         val_predictions,
                         val_batch,
                         mode=config.ink.data.mode,
+                        pu_unlabeled_label=config.ink.loss.pu_unlabeled_label,
                     )
                     primary_val_predictions = (
                         val_loss_predictions[0]
@@ -1125,6 +1154,7 @@ def _run_training(request: TrainingRequest) -> int:
                                 ema_predictions,
                                 val_batch,
                                 mode=config.ink.data.mode,
+                                pu_unlabeled_label=config.ink.loss.pu_unlabeled_label,
                             )
                         )
                         ema_targets_with_ignore = (
