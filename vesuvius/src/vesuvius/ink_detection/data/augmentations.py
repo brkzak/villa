@@ -38,6 +38,11 @@ from vesuvius.models.augmentation.transforms.spatial.low_resolution import (
 )
 from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
 from vesuvius.models.augmentation.transforms.spatial.rot90 import Rot90Transform
+from vesuvius.models.augmentation.transforms.spatial.spatial import (
+    SpatialTransform,
+    create_affine_matrix_2d,
+    create_affine_matrix_3d,
+)
 from vesuvius.models.augmentation.transforms.spatial.transpose import (
     TransposeAxesTransform,
 )
@@ -393,23 +398,80 @@ def create_default_training_transforms(
     return ComposeTransforms(transforms)
 
 
+class InPlaneScaleSpatialTransform(SpatialTransform):
+    """Zoom the last two axes (Y, X) of a sample by one random factor; never the depth axis.
+
+    Scans of the same papyrus come at 7.9 to 9.4 um voxels, so a stroke's width in voxels differs between scans.
+    The factor ``s`` is drawn uniformly from ``[1 - scale_range, 1 + scale_range]`` and is the step of the sampling
+    grid: ``s > 1`` shows more papyrus (strokes look thinner), ``s < 1`` less (strokes look wider). The image is
+    resampled bilinearly; every label key (ink labels, supervision and other masks) by nearest neighbour, so label
+    values such as a PU "unlabeled" code stay exact. Where a zoom-out reaches past the sample, image and labels
+    are 0: the normalised median and unsupervised. The depth axis is sampled at its own positions, so its layers
+    stay exact. The patch keeps its shape and centre. SpatialTransform does the resampling; only the parameters
+    are drawn here.
+    """
+
+    def __init__(self, patch_size: tuple[int, ...], scale_range: float) -> None:
+        super().__init__(
+            patch_size,
+            patch_center_dist_from_border=0,
+            random_crop=False,
+            mode_seg="nearest",
+        )
+        if len(patch_size) not in (2, 3):
+            raise ValueError(f"in-plane scaling needs a 2D or 3D patch, got {tuple(patch_size)}")
+        scale_range = float(scale_range)
+        if not (np.isfinite(scale_range) and 0.0 < scale_range < 1.0):
+            raise ValueError(f"scale_range must be in (0, 1), got {scale_range}")
+        self.scale_range = scale_range
+
+    def get_parameters(self, **data_dict) -> dict:
+        shape = data_dict["image"].shape[1:]
+        if tuple(shape) != tuple(self.patch_size):
+            raise ValueError(f"sample shape {tuple(shape)} does not match the patch size {tuple(self.patch_size)}")
+        factor = float(np.random.uniform(1.0 - self.scale_range, 1.0 + self.scale_range))
+        if len(shape) == 3:
+            affine = create_affine_matrix_3d([0.0, 0.0, 0.0], [1.0, factor, factor])
+        else:
+            affine = create_affine_matrix_2d(0.0, [factor, factor])
+        return {
+            "affine": affine,
+            "elastic_offsets": None,
+            "center_location_in_pixels": [size / 2 for size in shape],
+        }
+
+
 def build_augmentations(
     preset: str,
     patch_size: tuple[int, ...],
     *,
     rotation_axes: tuple[int, ...] | None,
+    inplane_scale: tuple[float, float] | None = None,
 ) -> ComposeTransforms | None:
-    """Build one configured preset, returning no transform for `none`."""
+    """Build one configured preset, returning no transform for `none`.
+
+    ``inplane_scale`` is ``(probability, range)`` of :class:`InPlaneScaleSpatialTransform`, put first so every other
+    transform sees the zoomed sample; None or a probability of 0 adds nothing, so the preset is as it was.
+    """
 
     if preset == "none":
-        return None
-    if preset == "spatial_only":
-        return create_spatial_only_transforms(patch_size, rotation_axes)
-    if preset == "spatial_intensity_no_clip":
-        return create_spatial_intensity_no_clip_transforms(patch_size, rotation_axes)
-    if preset == "default":
-        return create_default_training_transforms(patch_size)
-    raise ValueError(f"unknown augmentation preset {preset!r}")
+        transforms = None
+    elif preset == "spatial_only":
+        transforms = create_spatial_only_transforms(patch_size, rotation_axes)
+    elif preset == "spatial_intensity_no_clip":
+        transforms = create_spatial_intensity_no_clip_transforms(patch_size, rotation_axes)
+    elif preset == "default":
+        transforms = create_default_training_transforms(patch_size)
+    else:
+        raise ValueError(f"unknown augmentation preset {preset!r}")
+    if inplane_scale is None or float(inplane_scale[0]) == 0.0:
+        return transforms
+    probability, scale_range = (float(value) for value in inplane_scale)
+    scale = RandomTransform(
+        InPlaneScaleSpatialTransform(tuple(patch_size), scale_range),
+        apply_probability=probability,
+    )
+    return ComposeTransforms([scale, *(transforms.transforms if transforms is not None else [])])
 
 
 def maybe_translate_crop_bbox(

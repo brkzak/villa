@@ -532,6 +532,11 @@ class AugmentationConfig:
     preset: Literal["default", "spatial_only", "spatial_intensity_no_clip", "none"] = "default"
     rotation_axes: tuple[int, ...] | None = None
     disabled: bool = False
+    # In-plane scale augmentation (``augmentation_inplane_scale``: {"probability", "range"}): with probability > 0
+    # a sample's Y and X are zoomed by one factor drawn from [1 - range, 1 + range]; the depth axis is never scaled.
+    # 0 (absent) adds no transform and draws no random number, so training is as before bit for bit.
+    inplane_scale_probability: float = 0.0
+    inplane_scale_range: float = 0.0
 
     @classmethod
     def from_mapping(cls, authored: Mapping[str, Any]) -> "AugmentationConfig":
@@ -542,11 +547,43 @@ class AugmentationConfig:
                 f"augmentation_preset must be one of {sorted(allowed)!r}, got {preset!r}"
             )
         axes = authored.get("augmentation_rotation_axes")
+        probability, scale_range = _inplane_scale_from_mapping(authored.get("augmentation_inplane_scale"))
         return cls(
             preset=preset,
             rotation_axes=None if axes is None else tuple(int(axis) for axis in axes),
             disabled=bool(authored.get("disable_augmentations", False)),
+            inplane_scale_probability=probability,
+            inplane_scale_range=scale_range,
         )
+
+
+# The largest in-plane scale range: at 0.5 a sample is zoomed by 0.5 to 1.5; beyond it a zoom-out would show more
+# padding than papyrus at the patch's edges.
+MAX_INPLANE_SCALE_RANGE = 0.5
+
+
+def _inplane_scale_from_mapping(value: Any) -> tuple[float, float]:
+    """``(probability, range)`` of ``augmentation_inplane_scale``; ``(0.0, 0.0)`` when absent or None.
+
+    Raises:
+        ValueError: not a mapping of exactly ``probability`` and ``range``, a probability outside (0, 1], or a range
+            outside (0, ``MAX_INPLANE_SCALE_RANGE``].
+    """
+    if value is None:
+        return 0.0, 0.0
+    if not isinstance(value, Mapping) or set(value) != {"probability", "range"}:
+        raise ValueError(
+            "augmentation_inplane_scale must be a mapping with exactly 'probability' and 'range', "
+            f"got {value!r}"
+        )
+    probability, scale_range = float(value["probability"]), float(value["range"])
+    if not (math.isfinite(probability) and 0.0 < probability <= 1.0):
+        raise ValueError(f"augmentation_inplane_scale.probability must be in (0, 1], got {probability}")
+    if not (math.isfinite(scale_range) and 0.0 < scale_range <= MAX_INPLANE_SCALE_RANGE):
+        raise ValueError(
+            f"augmentation_inplane_scale.range must be in (0, {MAX_INPLANE_SCALE_RANGE}], got {scale_range}"
+        )
+    return probability, scale_range
 
 
 @dataclass(frozen=True)

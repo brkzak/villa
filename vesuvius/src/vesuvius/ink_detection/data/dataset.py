@@ -141,6 +141,10 @@ class InkDataset(Dataset):
                 config.augmentation.preset,
                 config.patch_size,
                 rotation_axes=config.augmentation.rotation_axes,
+                inplane_scale=(
+                    config.augmentation.inplane_scale_probability,
+                    config.augmentation.inplane_scale_range,
+                ),
             )
         self.geometric_augmentations = None
         self.photometric_augmentations = None
