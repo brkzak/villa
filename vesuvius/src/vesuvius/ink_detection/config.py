@@ -1093,6 +1093,8 @@ class LossTermConfig:
     # Positive-unlabeled BCE (losses.LabelSmoothedDCAndBCELoss, PU loss): the share of ink among the unlabeled pixels,
     # strictly between 0 and 1; None is the plain loss.
     pu_prior: float | None = None
+    # What the PU loss does with a negative estimate (losses.PU_NEGATIVE_RISKS): "abs" (nnPU) or "clamp" (ScribblePU).
+    pu_negative_risk: str = "abs"
 
 
 # The ink label value that marks an unlabeled pixel for the PU loss when the config names none (``pu_unlabeled_label``):
@@ -1109,6 +1111,19 @@ def _pu_prior(term: Mapping[str, Any], authored: Mapping[str, Any], index: int) 
     if not (math.isfinite(value) and 0.0 < value < 1.0):
         raise ValueError(f"loss.terms[{index}].pu_prior must be strictly between 0 and 1, got {value}")
     return value
+
+
+def _pu_negative_risk(term: Mapping[str, Any], authored: Mapping[str, Any], index: int, prior: float | None) -> str:
+    """A loss term's PU negative risk: the term's own ``pu_negative_risk``, else the config's top-level one, else
+    "abs" (nnPU). Refused on a term without a PU prior, where it would change nothing without saying so."""
+    value = term.get("pu_negative_risk", authored.get("pu_negative_risk"))
+    if value is None:
+        return "abs"
+    if value not in ("abs", "clamp"):
+        raise ValueError(f"loss.terms[{index}].pu_negative_risk must be 'abs' or 'clamp', got {value!r}")
+    if prior is None:
+        raise ValueError(f"loss.terms[{index}].pu_negative_risk is set but the term has no pu_prior")
+    return str(value)
 
 
 def _pu_unlabeled_label(authored: Mapping[str, Any]) -> int:
@@ -1169,6 +1184,7 @@ class LossConfig:
                         for key in ("bce_ink_weight", "bce_background_weight", "pu_prior")
                         if key in raw_loss
                     },
+                    **({"pu_negative_risk": raw_loss["pu_negative_risk"]} if "pu_negative_risk" in raw_loss else {}),
                 }
             ]
         else:
@@ -1236,6 +1252,7 @@ class LossConfig:
                         value, authored, "bce_background_weight", index
                     ),
                     pu_prior=_pu_prior(value, authored, index),
+                    pu_negative_risk=_pu_negative_risk(value, authored, index, _pu_prior(value, authored, index)),
                 )
             )
         if not terms:

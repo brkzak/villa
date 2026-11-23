@@ -450,3 +450,90 @@ def test_pu_labels_reach_the_configured_loss_through_the_training_glue():
     l_ink, l_pap = bce(x, torch.ones_like(x), reduction="none"), bce(x, torch.zeros_like(x), reduction="none")
     risk_u = 0.3 * l_ink[0] + (l_pap[1:3].mean() - 0.3 * l_pap[0]).abs()
     torch.testing.assert_close(actual, (l_ink[0] + l_pap[3] + 2 * risk_u) / 4, rtol=1e-6, atol=1e-7)
+
+
+def _clamp_bce(prior: float, *, smoothing: float = 0.0):
+    return LabelSmoothedDCAndBCELoss(
+        bce_kwargs={},
+        soft_dice_kwargs={"label_smoothing": 0.0},
+        weight_dice=0.0,
+        weight_ce=1.0,
+        use_ignore_label=True,
+        bce_label_smoothing=smoothing,
+        pu_prior=prior,
+        pu_negative_risk="clamp",
+    )
+
+
+def test_clamped_pu_loss_matches_the_hand_computed_scribblepu_risk():
+    """The clamp variant must be ScribblePU's no-ascent risk: a negative estimate of U's not-ink loss counts as 0,
+    so every U pixel weighs prior * mean_P l+ only."""
+    logits = torch.tensor([[[[3.0, -6.0, -6.0, -1.0]]]])
+    target = _pu_target([1.0, 0.5, 0.5, 0.0], [0.0, 1.0, 1.0, 0.0])
+    prior = 0.9
+
+    actual = _clamp_bce(prior)(logits, target)
+
+    bce = nn.functional.binary_cross_entropy_with_logits
+    x = logits.flatten()
+    l_ink = bce(x, torch.ones_like(x), reduction="none")
+    l_pap = bce(x, torch.zeros_like(x), reduction="none")
+    negative = l_pap[1:3].mean() - prior * l_pap[0:1].mean()
+    assert float(negative) < 0  # the case where the two variants differ
+    expected = (l_ink[0] + l_pap[3] + 2 * prior * l_ink[0]) / 4
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_clamped_pu_loss_never_pushes_labelled_ink_toward_papyrus():
+    """ScribblePU's reason for the clamp: with a negative estimate, nnPU's absolute value pushes the labelled ink
+    (P) down; the clamp must keep pulling P up and leave U without a gradient."""
+    target = _pu_target([1.0, 0.5, 0.5], [0.0, 1.0, 1.0])
+
+    nnpu = torch.tensor([[[[3.0, -6.0, -6.0]]]], requires_grad=True)
+    _pu_bce(0.9, smoothing=0.0)(nnpu, target).backward()
+    clamp = torch.tensor([[[[3.0, -6.0, -6.0]]]], requires_grad=True)
+    _clamp_bce(0.9)(clamp, target).backward()
+
+    assert float(nnpu.grad[0, 0, 0, 0]) > 0  # nnPU's descent lowers the P logit
+    assert float(clamp.grad[0, 0, 0, 0]) < 0  # the clamp's descent raises it
+    assert float(clamp.grad[0, 0, 0, 1]) == 0.0
+    assert float(clamp.grad[0, 0, 0, 2]) == 0.0
+
+
+def test_pu_variants_agree_when_the_estimate_is_not_negative():
+    """Where U's not-ink loss estimate is 0 or more, the clamp must be nnPU exactly: it changes only the negative case."""
+    logits = torch.tensor([[[[1.5, 0.4, -2.0, 0.3, -0.7]]]])
+    target = _pu_target([1.0, 1.0, 0.0, 0.5, 0.5], [0.0, 0.0, 0.0, 1.0, 1.0])
+
+    assert torch.equal(_clamp_bce(0.3)(logits, target), _pu_bce(0.3, smoothing=0.0)(logits, target))
+
+
+def test_configured_pu_negative_risk_reaches_the_loss():
+    """A top-level pu_negative_risk must reach the loss; without one the PU loss stays nnPU ("abs")."""
+    authored = _config_mapping()
+    authored["pu_prior"] = 0.3
+    assert create_loss(InkConfig.from_mapping(authored)).terms[0].module.pu_negative_risk == "abs"
+
+    authored["pu_negative_risk"] = "clamp"
+    assert create_loss(InkConfig.from_mapping(authored)).terms[0].module.pu_negative_risk == "clamp"
+
+
+@pytest.mark.parametrize("value", ["ascent", "", 0])
+def test_pu_negative_risk_must_be_abs_or_clamp(value):
+    """An unknown variant must be refused, not trained as nnPU without a word."""
+    authored = _config_mapping()
+    authored["pu_prior"] = 0.3
+    authored["pu_negative_risk"] = value
+    with pytest.raises(ValueError):
+        InkConfig.from_mapping(authored)
+    with pytest.raises(ValueError):
+        LabelSmoothedDCAndBCELoss(bce_kwargs={}, soft_dice_kwargs={}, use_ignore_label=True, pu_prior=0.3,
+                                  pu_negative_risk=value)
+
+
+def test_pu_negative_risk_without_a_prior_is_refused():
+    """A variant without a PU prior would change nothing: refuse it so a config never claims a loss it lacks."""
+    authored = _config_mapping()
+    authored["pu_negative_risk"] = "clamp"
+    with pytest.raises(ValueError):
+        InkConfig.from_mapping(authored)

@@ -16,6 +16,10 @@ from vesuvius.models.training.loss.nnunet_losses import DC_and_BCE_loss
 # pixel out as before; 0.5 survives the nearest-neighbour downsampling of deep supervision and is never a hard label.
 PU_UNLABELED_TARGET = 0.5
 
+# What the PU loss does with a negative estimate of U's not-ink loss (LabelSmoothedDCAndBCELoss, PU loss): "abs"
+# reverses its gradient (nnPU), "clamp" drops it (ScribblePU's no-ascent risk).
+PU_NEGATIVE_RISKS = ("abs", "clamp")
+
 
 class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
     """Combine Dice and BCE with optional smoothing of BCE targets.
@@ -44,6 +48,17 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
     much as a labelled one. A batch without a P pixel or without a U pixel has no estimate; its U pixels then add
     nothing and the BCE is the labelled pixels' mean, as without PU. The Dice term never sees U. None (the default)
     is the loss without PU, bit for bit.
+
+    ``pu_negative_risk`` picks what a negative estimate does. ``"abs"`` (the default) is the absolute value above.
+    ``"clamp"`` is the no-ascent risk of ScribblePU (Domenico Russo, github.com/DomRusso2/scribble-pu, MIT):
+
+        R_U = prior * mean_P l+  +  max(0, mean_U l-  -  prior * mean_P l-)
+
+    so a negative estimate adds nothing and has no gradient, while ``prior * mean_P l+`` keeps pulling P toward ink.
+    The reason: with stroke centerlines as P, P is the brightest part of the ink, so ``prior * mean_P l-`` is larger
+    than the not-ink loss of the dimmer ink hidden in U, and the estimate falls below 0 often (16 to 60 % of tiles
+    in ScribblePU's tests). The absolute value then pushes P's predictions down toward papyrus with every such step;
+    the clamp does not. The two agree whenever the estimate is 0 or more.
     """
 
     def __init__(
@@ -53,6 +68,7 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
         bce_ink_weight: float = 1.0,
         bce_background_weight: float = 1.0,
         pu_prior: float | None = None,
+        pu_negative_risk: str = "abs",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -73,7 +89,10 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
         self.bce_label_smoothing = float(bce_label_smoothing)
         self.bce_ink_weight = float(bce_ink_weight)
         self.bce_background_weight = float(bce_background_weight)
+        if pu_negative_risk not in PU_NEGATIVE_RISKS:
+            raise ValueError(f"pu_negative_risk must be one of {PU_NEGATIVE_RISKS}, got {pu_negative_risk!r}")
         self.pu_prior = None if pu_prior is None else float(pu_prior)
+        self.pu_negative_risk = pu_negative_risk
 
     def _pu_bce_sum(
         self, net_output: torch.Tensor, target_regions: torch.Tensor, mask: torch.Tensor
@@ -97,7 +116,8 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
         risk_p_papyrus = (loss_as_papyrus * positive_f).sum() / n_positive_safe
         risk_u_papyrus = (loss_as_papyrus * unlabeled_f).sum() / n_unlabeled_safe
         negative = risk_u_papyrus - self.pu_prior * risk_p_papyrus
-        risk_u = self.pu_prior * risk_p_ink + negative.abs()
+        kept = negative.abs() if self.pu_negative_risk == "abs" else torch.clamp(negative, min=0.0)
+        risk_u = self.pu_prior * risk_p_ink + kept
         return risk_u * n_unlabeled * present, n_unlabeled * present
 
     def _class_weights(self, target_regions: torch.Tensor) -> torch.Tensor | None:
@@ -255,6 +275,7 @@ def create_loss(config: InkConfig) -> CompositeLoss:
             bce_ink_weight=term.bce_ink_weight,
             bce_background_weight=term.bce_background_weight,
             pu_prior=term.pu_prior,
+            pu_negative_risk=term.pu_negative_risk,
         )
         terms.append(
             WeightedLossTerm(
