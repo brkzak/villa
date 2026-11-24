@@ -537,3 +537,53 @@ def test_pu_negative_risk_without_a_prior_is_refused():
     authored["pu_negative_risk"] = "clamp"
     with pytest.raises(ValueError):
         InkConfig.from_mapping(authored)
+
+
+def _logit(p: float) -> float:
+    return math.log(p / (1.0 - p))
+
+
+def test_clamp_acts_at_the_smoothed_floor_not_at_zero():
+    """With label smoothing a papyrus BCE never falls below the smoothed target's entropy, so U's not-ink loss
+    estimate is wrong once it falls below (1 - prior) * H(s / 2), not 0. At reader-v3's smoothing 0.5 the estimate
+    almost never reaches 0, which left the ScribblePU clamp inactive (ft-20261124-0330 trained as nnPU did). Here the
+    estimate is above 0 but below the floor: the clamp must leave U without a gradient."""
+    p_ink, p_u = _logit(0.6), _logit(0.4)
+    target = _pu_target([1.0, 0.5, 0.5], [0.0, 1.0, 1.0])
+    logits = torch.tensor([[[[p_ink, p_u, p_u]]]], requires_grad=True)
+
+    loss = _clamp_bce(0.3, smoothing=0.5)
+    bce = nn.functional.binary_cross_entropy_with_logits
+    x = logits.detach().flatten()
+    l_pap = bce(x, torch.full_like(x, 0.25), reduction="none")
+    module_negative = float(l_pap[1:].mean() - 0.3 * l_pap[0])
+    floor = 0.7 * -(0.25 * math.log(0.25) + 0.75 * math.log(0.75))
+    assert 0.0 < module_negative < floor  # the case the floor changes
+
+    loss(logits, target).backward()
+
+    assert float(logits.grad[0, 0, 0, 1]) == 0.0
+    assert float(logits.grad[0, 0, 0, 2]) == 0.0
+    assert float(logits.grad[0, 0, 0, 0]) < 0  # P is still pulled toward ink
+
+
+def test_smoothed_pu_loss_matches_the_hand_computed_floored_risk():
+    """The value with smoothing and a background weight: R_U = prior * mean_P l+ + f(estimate - F) + F, with F the
+    floor (class docstring), for both variants."""
+    logits = torch.tensor([[[[1.2, 0.6, -0.9, -0.2, -1.4]]]])
+    target = _pu_target([1.0, 1.0, 0.0, 0.5, 0.5], [0.0, 0.0, 0.0, 1.0, 1.0])
+    prior, s, w_bg = 0.3, 0.5, 2.0
+
+    bce = nn.functional.binary_cross_entropy_with_logits
+    x = logits.flatten()
+    l_ink = bce(x, torch.full_like(x, 1 - s / 2), reduction="none")
+    l_pap = bce(x, torch.full_like(x, s / 2), reduction="none") * w_bg
+    floor = (1 - prior) * w_bg * -((s / 2) * math.log(s / 2) + (1 - s / 2) * math.log(1 - s / 2))
+    excess = l_pap[3:5].mean() - prior * l_pap[0:2].mean() - floor
+    labelled = l_ink[0] + l_ink[1] + l_pap[2]
+    for variant, f in (("abs", excess.abs()), ("clamp", torch.clamp(excess, min=0.0))):
+        module = LabelSmoothedDCAndBCELoss(bce_kwargs={}, soft_dice_kwargs={"label_smoothing": 0.0}, weight_dice=0.0,
+                                           weight_ce=1.0, use_ignore_label=True, bce_label_smoothing=s,
+                                           bce_background_weight=w_bg, pu_prior=prior, pu_negative_risk=variant)
+        risk_u = prior * l_ink[0:2].mean() + f + floor
+        torch.testing.assert_close(module(logits, target), (labelled + 2 * risk_u) / 5, rtol=1e-6, atol=1e-6)

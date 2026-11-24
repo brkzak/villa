@@ -59,6 +59,20 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
     than the not-ink loss of the dimmer ink hidden in U, and the estimate falls below 0 often (16 to 60 % of tiles
     in ScribblePU's tests). The absolute value then pushes P's predictions down toward papyrus with every such step;
     the clamp does not. The two agree whenever the estimate is 0 or more.
+
+    Label smoothing and the floor: both risks above assume a pixel's loss reaches 0 when the prediction is right.
+    With BCE label smoothing ``s`` the papyrus target is ``s / 2`` and a pixel's papyrus BCE is never below that
+    target's binary entropy ``H(s / 2)`` (times the background weight): 0.562 nats at reader-v3's 0.5. U's not-ink
+    loss is then at least ``(1 - prior) * H(s / 2)``, and the estimate falls below that floor, not below 0, when it
+    is wrong. Without the floor the check would wait for the estimate to reach 0, which at ``s`` 0.5, prior 0.3 and
+    weight 2 needs a mean P prediction above about 0.92: the clamp (and nnPU's reversal) would never act. Both
+    variants therefore act on the excess over the floor:
+
+        R_U = prior * mean_P l+  +  f(mean_U l-  -  prior * mean_P l-  -  F)  +  F,   F = (1 - prior) * H(s / 2) * w_bg
+
+    with ``f`` the absolute value (``"abs"``) or ``max(0, .)`` (``"clamp"``). ``F`` is a constant, so where the
+    excess is 0 or more the value and gradient are those above; without smoothing ``F`` is 0 and the loss is as
+    before, bit for bit.
     """
 
     def __init__(
@@ -116,9 +130,22 @@ class LabelSmoothedDCAndBCELoss(DC_and_BCE_loss):
         risk_p_papyrus = (loss_as_papyrus * positive_f).sum() / n_positive_safe
         risk_u_papyrus = (loss_as_papyrus * unlabeled_f).sum() / n_unlabeled_safe
         negative = risk_u_papyrus - self.pu_prior * risk_p_papyrus
-        kept = negative.abs() if self.pu_negative_risk == "abs" else torch.clamp(negative, min=0.0)
-        risk_u = self.pu_prior * risk_p_ink + kept
+        # The estimate's true floor (class docstring, Label smoothing and the floor): U's not-ink pixels cannot have
+        # a mean papyrus loss below the smoothed target's own entropy, so the check is made on the excess over it.
+        floor = (1.0 - self.pu_prior) * self._papyrus_loss_floor()
+        excess = negative - floor
+        kept = excess.abs() if self.pu_negative_risk == "abs" else torch.clamp(excess, min=0.0)
+        risk_u = self.pu_prior * risk_p_ink + kept + floor
         return risk_u * n_unlabeled * present, n_unlabeled * present
+
+    def _papyrus_loss_floor(self) -> float:
+        """The least a pixel's papyrus BCE can be: the binary entropy (nats) of the smoothed not-ink target, times
+        the background weight. 0.0 without smoothing, where the loss reaches 0 at a sure prediction."""
+        target = 0.5 * self.bce_label_smoothing
+        if target == 0.0:
+            return 0.0
+        entropy = -(target * math.log(target) + (1.0 - target) * math.log(1.0 - target))
+        return entropy * self.bce_background_weight
 
     def _class_weights(self, target_regions: torch.Tensor) -> torch.Tensor | None:
         """Per-pixel BCE weights from the unsmoothed label (None when both weights are 1: no multiply at all)."""
